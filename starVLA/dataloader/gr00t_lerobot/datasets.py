@@ -51,21 +51,18 @@ from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
 
 from functools import partial
 from typing import Tuple, List
-import pickle
 
-# LeRobot v2.0 dataset file names 
+from datasets import Dataset as HFDataset
+
+
+# LeRobot v3.0 dataset file names
 LE_ROBOT_MODALITY_FILENAME = "meta/modality.json"
-LE_ROBOT_EPISODE_FILENAME = "meta/episodes.jsonl"
-LE_ROBOT_TASKS_FILENAME = "meta/tasks.jsonl"
 LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats_gr00t.json"
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
-LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
+LE_ROBOT_TASKS_FILENAME = "meta/tasks.parquet"
+LE_ROBOT_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 EPSILON = 5e-4
-
-#  LeRobot v3.0 dataset file names 
-LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
-LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
@@ -132,7 +129,6 @@ class LeRobotSingleDataset(Dataset):
         video_backend: str = "decord",
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
-        delete_pause_frame: bool = False,
         data_cfg = None,
         **kwargs,
     ):
@@ -152,14 +148,16 @@ class LeRobotSingleDataset(Dataset):
         self.data_cfg = data_cfg
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
-        # indict letobot version
-        self._lerobot_version =  self.data_cfg.get("lerobot_version", "v2.0") #self._indict_lerobot_version(**kwargs)
-
-        self.delete_pause_frame = delete_pause_frame
-
         self.modality_configs = modality_configs
         self.video_backend = video_backend
-        self.video_backend_kwargs = video_backend_kwargs if video_backend_kwargs is not None else {}
+        self.video_backend_kwargs = dict(video_backend_kwargs) if video_backend_kwargs is not None else {}
+        # Never trust manually provided fixed_fps: always derive per-dataset fps from info.json metadata.
+        if "fixed_fps" in self.video_backend_kwargs:
+            self.video_backend_kwargs.pop("fixed_fps", None)
+            print(
+                "Ignore manual video_backend_kwargs['fixed_fps']; "
+                "will use fps from dataset info.json automatically."
+            )
         self.transforms = (
             transforms if transforms is not None else ComposedModalityTransform(transforms=[])
         )
@@ -179,15 +177,24 @@ class LeRobotSingleDataset(Dataset):
         self._data_path_pattern = self._get_data_path_pattern()
         self._video_path_pattern = self._get_video_path_pattern()
         self._chunk_size = self._get_chunk_size()
+        self._task_index_to_task: dict[int, str] = {}
         self._tasks = self._get_tasks()
         # self._episodes = self._get_episode_info() # TODO why we need this func
         self.curr_traj_data = None
         self.curr_traj_id = None
+        self._curr_episode_id: int | None = None
+        self._curr_row_idx: int | None = None
+        self._curr_from_index: int = 0
+        self._curr_to_index: int = 0
+        self._curr_length: int = 0
+        self._curr_episode_row: dict | None = None
+
+        self._load_episodes_hf()
+        self._load_hf_dataset()
 
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
-        self._all_steps = self._get_all_steps()
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
@@ -218,20 +225,6 @@ class LeRobotSingleDataset(Dataset):
         The order of the lengths is the same as the order of the trajectory IDs.
         """
         return self._trajectory_lengths
-
-    @property
-    def all_steps(self) -> list[tuple[int, int]]:
-        """The trajectory IDs and base indices for all steps in the dataset.
-        Example:
-            self.trajectory_ids: [0, 1, 2]
-            self.trajectory_lengths: [3, 2, 4]
-            return: [
-                ("traj_0", 0), ("traj_0", 1), ("traj_0", 2),
-                ("traj_1", 0), ("traj_1", 1),
-                ("traj_2", 0), ("traj_2", 1), ("traj_2", 2), ("traj_2", 3)
-            ]
-        """
-        return self._all_steps
 
     @property
     def modality_keys(self) -> dict:
@@ -295,6 +288,20 @@ class LeRobotSingleDataset(Dataset):
             dict: The metadata for the dataset.
         """
 
+        # Get used keys from modality_configs (if available) to filter metadata
+        used_keys = {}
+        if hasattr(self, 'modality_configs') and self.modality_configs:
+            for modality, config in self.modality_configs.items():
+                if hasattr(config, 'modality_keys'):
+                    # Extract subkey from full key (e.g., "state.eef_position" -> "eef_position")
+                    used_keys[modality] = set()
+                    for full_key in config.modality_keys:
+                        parts = full_key.split(".", 1)
+                        if len(parts) == 2:
+                            used_keys[modality].add(parts[1])
+                        else:
+                            used_keys[modality].add(full_key)
+
         # 1. Modality metadata
         modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
         assert (
@@ -306,10 +313,18 @@ class LeRobotSingleDataset(Dataset):
             le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
+            
+            # If modality_configs is provided but this modality is not in it, skip entirely
+            if used_keys and modality not in used_keys:
+                continue
+                
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
                 le_modality_meta, modality
             )
             for subkey in le_state_action_meta:
+                # Filter: only include keys that are used in modality_configs
+                if modality in used_keys and subkey not in used_keys[modality]:
+                    continue
                 state_action_dtype = np.dtype(le_state_action_meta[subkey].dtype)
                 if np.issubdtype(state_action_dtype, np.floating):
                     continuous = True
@@ -332,11 +347,26 @@ class LeRobotSingleDataset(Dataset):
         with open(le_info_path, "r") as f:
             le_info = json.load(f)
         simplified_modality_meta["video"] = {}
+        info_features = le_info.get("features", {})
         for new_key in le_modality_meta.video:
+            # Filter: only include video keys that are used in modality_configs
+            if "video" in used_keys and new_key not in used_keys["video"]:
+                continue
             original_key = le_modality_meta.video[new_key].original_key
             if original_key is None:
                 original_key = new_key
-            le_video_meta = le_info["features"][original_key]
+            le_video_meta = info_features.get(original_key)
+            if le_video_meta is None:
+                # Fallback: use first available video feature from info (e.g. dataset has image/image2 but info lists one)
+                for k, v in info_features.items():
+                    if v.get("dtype") == "video":
+                        le_video_meta = v
+                        break
+            if le_video_meta is None:
+                raise KeyError(
+                    f"Video key '{original_key}' not in info.json features {list(info_features.keys())}. "
+                    "Ensure meta/info.json features match modality.json video keys."
+                )
             height = le_video_meta["shape"][le_video_meta["names"].index("height")]
             width = le_video_meta["shape"][le_video_meta["names"].index("width")]
             # NOTE(FH): different lerobot dataset versions have different keys for the number of channels and fps
@@ -344,9 +374,8 @@ class LeRobotSingleDataset(Dataset):
                 channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
                 fps = le_video_meta["video_info"]["video.fps"]
             except (ValueError, KeyError):
-                # channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
-                channels = le_video_meta["info"]["video.channels"]
-                fps = le_video_meta["info"]["video.fps"]
+                channels = le_video_meta.get("info", {}).get("video.channels", 3)
+                fps = le_video_meta.get("info", {}).get("video.fps", le_video_meta.get("video_info", {}).get("video.fps", 30))
             simplified_modality_meta["video"][new_key] = {
                 "resolution": [width, height],
                 "channels": channels,
@@ -431,160 +460,50 @@ class LeRobotSingleDataset(Dataset):
 
     def _get_trajectories(self) -> tuple[np.ndarray, np.ndarray]:
         """Get the trajectories in the dataset."""
-        # Get trajectory lengths, IDs, and whitelist from dataset metadata
-        # v2.0
-        if self._lerobot_version == "v2.0":
-            file_path = self.dataset_path / LE_ROBOT_EPISODE_FILENAME
-            with open(file_path, "r") as f:
-                episode_metadata = [json.loads(line) for line in f]
-            trajectory_ids = []
-            trajectory_lengths = []
-            for episode in episode_metadata:
-                trajectory_ids.append(episode["episode_index"])
-                trajectory_lengths.append(episode["length"])
-            return np.array(trajectory_ids), np.array(trajectory_lengths)
-        # v3.0
-        elif self._lerobot_version == "v3.0":
-            file_paths = list((self.dataset_path).glob(LE_ROBOT3_EPISODE_FILENAME))
-            trajectory_ids = []
-            trajectory_lengths = []
-            # data_chunck_index = []
-            # data_file_index = []
-            # vido_from_index = []
-            self.trajectory_ids_to_metadata = {}
-            for file_path in file_paths:
-                episodes_data = pd.read_parquet(file_path)
-                for index, episode in episodes_data.iterrows():
-                    trajectory_ids.append(episode["episode_index"])
-                    trajectory_lengths.append(episode["length"])
+        if not hasattr(self, "episodes_hf") or self.episodes_hf is None:
+            raise RuntimeError("LeRobot v3.0 requires _load_episodes_hf() to be called before _get_trajectories()")
+        trajectory_ids = []
+        trajectory_lengths = []
+        # Always build mapping: episode_index -> row index
+        self._episode_index_to_row: dict[int, int] = {}
+        self._trajectory_id_to_index: dict[int, int] = {}
+        for i in range(len(self.episodes_hf)):
+            row = self.episodes_hf[i]
+            ep_idx = int(row["episode_index"])
+            self._episode_index_to_row[ep_idx] = i
+            self._trajectory_id_to_index[ep_idx] = len(trajectory_ids)
+            trajectory_ids.append(ep_idx)  # Use episode_index column value (semantic ID)
+            trajectory_lengths.append(int(row["length"]))
+        print(f"[INFO] Built episode_index->row mapping ({len(self._episode_index_to_row)} episodes)")
 
-                    # TODO auto map key? just map to file_path and file_from_index
-                    episode_meta = {
-                        "data/chunk_index": episode["data/chunk_index"],
-                        "data/file_index": episode["data/file_index"],
-                        "data/file_from_index": index,
-                        "videos/observation.images.wrist/from_timestamp": episode["videos/observation.images.wrist/from_timestamp"],
-                    }
-                    self.trajectory_ids_to_metadata[trajectory_ids[-1]] = episode_meta
+        # Detect video keys from episode columns (e.g. videos/observation.images.image/from_timestamp)
+        self._detected_video_keys = []
+        for col in self.episodes_hf.column_names:
+            if col.startswith("videos/") and col.endswith("/from_timestamp"):
+                vid_key = col.replace("videos/", "").replace("/from_timestamp", "")
+                self._detected_video_keys.append(vid_key)
+        if self._detected_video_keys:
+            print(f"[INFO] Video keys from episodes (official): {self._detected_video_keys}")
+        return np.array(trajectory_ids), np.array(trajectory_lengths)
 
-            # 这里应该可以直接读取到 save index 信息
-            return np.array(trajectory_ids), np.array(trajectory_lengths)
-
-    def _get_all_steps(self) -> list[tuple[int, int]]:
-        """Get the trajectory IDs and base indices for all steps in the dataset.
-
-        Returns:
-            list[tuple[str, int]]: A list of (trajectory_id, base_index) tuples.
-        """
-        def is_main():
-            return (not dist.is_initialized()) or dist.get_rank() == 0
-    
-        config_key = self._get_steps_config_key()
-        steps_filename = "steps_data_index.pkl"
-        steps_path = self.dataset_path / "meta" / steps_filename
-    
-        # ---------- try to read from cache  ----------
-        if steps_path.exists():
-            try:
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
-            except Exception as e:
-                # include EOFError / PickleError / KeyError
-                print(
-                    f"[RANK {os.environ.get('RANK', 'NA')}] "
-                    f"Failed to load cached steps ({e}), will rebuild."
-                )
-    
-        # ---------- only build by rank0  ----------
-        if is_main():
-            all_steps = self._get_all_steps_single_process()
-    
-            cache_data = {
-                "config_key": config_key,
-                "steps": all_steps,
-                "num_trajectories": len(self.trajectory_ids),
-                "total_steps": len(all_steps),
-                "computed_timestamp": pd.Timestamp.now().isoformat(),
-                "delete_pause_frame": self.delete_pause_frame,
-            }
-    
-            steps_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = steps_path.with_suffix(".tmp")
-    
-            with open(tmp_path, "wb") as f:
-                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp_path, steps_path)
-    
-            print(f"[RANK 0] Cached steps saved to {steps_path}")
-    
-        # ---------- sync after rank0  ----------
-        if dist.is_initialized():
-            dist.barrier()
-    
-        # ---------- read by all rank ----------
-        with open(steps_path, "rb") as f:
-            cached_data = pickle.load(f)
-    
-        return cached_data["steps"]
-
-    def _get_steps_config_key(self) -> str:
-        """Generate a configuration key for steps caching."""
-        config_dict = {
-            "delete_pause_frame": self.delete_pause_frame,
-            "dataset_name": self.dataset_name,
-        }
-        # Create a hash of the configuration
-        config_str = str(sorted(config_dict.items()))
-        return hashlib.md5(config_str.encode()).hexdigest()[:12]  #
-
-
-    def _get_all_steps_single_process(self) -> list[tuple[int, int]]:
-        """Original single-process implementation as fallback."""
-        all_steps: list[tuple[int, int]] = []
-        skipped_trajectories = 0
-        processed_trajectories = 0
+    def abs_index_to_episode_step(self, abs_idx: int) -> tuple[int, int]:
+        """Convert a global frame index to (trajectory_id, base_index).
         
-        # Check if language modality is configured
-        has_language_modality = 'language' in self.modality_keys and len(self.modality_keys['language']) > 0
-        # TODO why trajectory_length here, why not use data length?
-        for trajectory_id, trajectory_length in tqdm(zip(self.trajectory_ids, self.trajectory_lengths), total=len(self.trajectory_ids), desc="Getting All Step"):
-            try:
-                if self._lerobot_version == "v2.0":
-                    data = self.get_trajectory_data(trajectory_id)
-                elif self._lerobot_version == "v3.0":
-                    data = self.get_trajectory_data_lerobot_v3(trajectory_id)
-                
-                trajectory_skipped = False
+        This follows the official LeRobot v3 approach: use hf_dataset absolute index
+        and map it to episode-relative index using episode metadata.
+        
+        Args:
+            abs_idx: Global index into hf_dataset (0 <= abs_idx < len(hf_dataset))
             
-                # Check if trajectory has valid language instruction (if language modality is configured)
-                if has_language_modality:
-                    self.curr_traj_data = data  # Set current trajectory data for get_language to work
-
-                    language_instruction = self.get_language(trajectory_id, self.modality_keys['language'][0], 0)
-                    if not language_instruction or language_instruction[0] == "":
-                        print(f"Skipping trajectory {trajectory_id} due to empty language instruction")
-                        skipped_trajectories += 1
-                        trajectory_skipped = True
-                        continue
-
-            except Exception as e:
-                print(f"Skipping trajectory {trajectory_id} due to read error: {e}")
-                skipped_trajectories += 1
-                trajectory_skipped = True
-                continue
-        
-            if not trajectory_skipped:
-                processed_trajectories += 1
-        
-            for base_index in range(trajectory_length):
-                all_steps.append((trajectory_id, base_index))
-                
-        # Print summary statistics
-        print(f"Single-process summary: Processed {processed_trajectories} trajectories, skipped {skipped_trajectories} empty trajectories")
-        print(f"Total steps: {len(all_steps)} from {len(self.trajectory_ids)} trajectories")
-                   
-        return all_steps
+        Returns:
+            tuple[int, int]: (trajectory_id, base_index) where base_index is 
+                the step's position within the trajectory.
+        """
+        item = self.hf_dataset[abs_idx]
+        trajectory_id = int(item["episode_index"])
+        row_idx = self._episode_index_to_row[trajectory_id]
+        from_index = int(self.episodes_hf[row_idx]["dataset_from_index"])
+        return trajectory_id, abs_idx - from_index
 
     def _get_position_and_gripper_values(self, data: pd.DataFrame) -> tuple[list, list]:
         """Get position and gripper values based on available columns in the dataset."""
@@ -731,22 +650,97 @@ class LeRobotSingleDataset(Dataset):
         """Get the chunk size for the LeRobot dataset."""
         return self.lerobot_info_meta["chunks_size"]
 
+    def _load_episodes_hf(self) -> None:
+        """Official LeRobot v3.0: load episode metadata as HuggingFace Dataset."""
+        episodes_dir = self.dataset_path / "meta" / "episodes"
+        paths = sorted(episodes_dir.glob("*/*.parquet"))
+        # if not paths:
+        #     raise FileNotFoundError(f"No episode parquet files in {episodes_dir}")
+        
+        # # Sort by numeric chunk and file indices
+        # import re
+        # def _parse_path_indices(p: Path) -> tuple[int, int]:
+        #     chunk_dir = p.parent.name
+        #     file_name = p.stem
+        #     chunk_match = re.search(r'(\d+)', chunk_dir)
+        #     chunk_idx = int(chunk_match.group(1)) if chunk_match else 0
+        #     file_match = re.search(r'(\d+)', file_name)
+        #     file_idx = int(file_match.group(1)) if file_match else 0
+        #     return (chunk_idx, file_idx)
+        
+        # paths = sorted(paths, key=_parse_path_indices)
+        
+        self.episodes_hf = HFDataset.from_parquet([str(p) for p in paths])
+        # Drop stats/ columns like official load_episodes
+        cols = [k for k in self.episodes_hf.column_names if not k.startswith("stats/")]
+        self.episodes_hf = self.episodes_hf.select_columns(cols)
+        # print(f"[INFO] Loaded {len(self.episodes_hf)} episodes (HF Dataset)")
+
+    def _load_hf_dataset(self) -> None:
+        """Official LeRobot v3.0: load all data parquet files as single HuggingFace Dataset (global index)."""
+        data_dir = self.dataset_path / "data"
+        paths = list(data_dir.glob("*/*.parquet"))
+        if not paths:
+            raise FileNotFoundError(f"No data parquet files in {data_dir}")
+        
+        # Sort by numeric chunk and file indices to match episodes metadata order
+        # Handles both "chunk-000/file-000.parquet" and "0/0000.parquet" formats
+        def _parse_path_indices(p: Path) -> tuple[int, int]:
+            """Extract (chunk_index, file_index) from path for numeric sorting."""
+            import re
+            chunk_dir = p.parent.name  # e.g., "chunk-000" or "0"
+            file_name = p.stem  # e.g., "file-000" or "0000"
+            
+            # Extract numbers from chunk dir name
+            chunk_match = re.search(r'(\d+)', chunk_dir)
+            chunk_idx = int(chunk_match.group(1)) if chunk_match else 0
+            
+            # Extract numbers from file name
+            file_match = re.search(r'(\d+)', file_name)
+            file_idx = int(file_match.group(1)) if file_match else 0
+            
+            return (chunk_idx, file_idx)
+        
+        # Sort paths by (chunk_index, file_index) numerically
+        paths = sorted(paths, key=_parse_path_indices)
+        
+        self.hf_dataset = HFDataset.from_parquet([str(p) for p in paths])
+        print(f"[INFO] Loaded HF dataset with {len(self.hf_dataset)} frames")
+
     def _get_tasks(self) -> pd.DataFrame:
         """Get the tasks for the dataset."""
-        if self._lerobot_version == "v2.0":
-            tasks_path = self.dataset_path / LE_ROBOT_TASKS_FILENAME
-            with open(tasks_path, "r") as f:
-                tasks = [json.loads(line) for line in f]
-            df = pd.DataFrame(tasks)
-            return df.set_index("task_index")
-        
-        elif self._lerobot_version == "v3.0":
-            tasks_path = self.dataset_path / LE_ROBOT3_TASKS_FILENAME
-            df = pd.read_parquet(tasks_path)
-            df = df.reset_index()  # 把索引变成一列，列名通常为 'index'
-            df = df.rename(columns={'index': 'task'})  # 把 'index' 列重命名为 'task'
-            df = df[['task_index', 'task']]  # 调整列顺序
-            return df
+        tasks_path = self.dataset_path / LE_ROBOT_TASKS_FILENAME
+        df = pd.read_parquet(tasks_path)
+        if "task_index" not in df.columns:
+            index_name = df.index.name if df.index.name is not None else "index"
+            df = df.reset_index().rename(columns={index_name: "task_index"})
+
+        if "task" not in df.columns:
+            # Some datasets (e.g. LIBERO exports) store task text in the row index.
+            if not isinstance(df.index, pd.RangeIndex):
+                df = df.copy()
+                df["task"] = df.index.astype(str)
+            if "task" not in df.columns:
+                for fallback_col in ("task_name", "instruction", "text"):
+                    if fallback_col in df.columns:
+                        df = df.rename(columns={fallback_col: "task"})
+                        break
+
+        if "task_index" not in df.columns or "task" not in df.columns:
+            raise KeyError(
+                f"Invalid tasks schema in {tasks_path}, expected columns ['task_index', 'task'], got {list(df.columns)}"
+            )
+
+        df = df[["task_index", "task"]].copy()
+        df["task_index"] = df["task_index"].astype(int)
+        df["task"] = df["task"].fillna("").astype(str)
+        df = df.drop_duplicates(subset="task_index", keep="first")
+        self._task_index_to_task = {
+            int(task_index): task
+            for task_index, task in zip(df["task_index"], df["task"])
+        }
+        return df
+
     def _check_integrity(self):
         """Use the config to check if the keys are valid and detect silent data corruption."""
         ERROR_MSG_HEADER = f"Error occurred in initializing dataset {self.dataset_name}:\n"
@@ -781,7 +775,9 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             int: the total number of data points in the dataset.
         """
-        return len(self.all_steps)
+        if self.hf_dataset is None:
+            raise RuntimeError("hf_dataset is not loaded. Ensure _load_hf_dataset() ran successfully.")
+        return len(self.hf_dataset)
 
     def __str__(self) -> str:
         """Get the description of the dataset."""
@@ -797,7 +793,15 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             dict: The data for the step.
         """
-        trajectory_id, base_index = self.all_steps[index]
+        if self.hf_dataset is None:
+            raise RuntimeError("hf_dataset is not loaded. Ensure _load_hf_dataset() ran successfully.")
+        item = self.hf_dataset[index]
+        trajectory_id = int(item["episode_index"])
+        # Calculate base_index within episode using dataset_from_index
+        row_idx = self._episode_index_to_row[trajectory_id]
+        ep = self.episodes_hf[row_idx]
+        from_index = int(ep["dataset_from_index"])
+        base_index = index - from_index
         data = self.get_step_data(trajectory_id, base_index)
         
         # Process all video keys dynamically
@@ -820,7 +824,11 @@ class LeRobotSingleDataset(Dataset):
         
         return dict(action=action, image=images, language=language)
 
-    def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
+    def get_step_data(
+        self,
+        trajectory_id: int,
+        base_index: int,
+    ) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
 
         Args:
@@ -846,57 +854,55 @@ class LeRobotSingleDataset(Dataset):
                 },
             }
         """
-        data = {}
-        # Get the data for all modalities # just for action base data
-        self.curr_traj_data = self.get_trajectory_data(trajectory_id)
-        # TODO @JinhuiYE The logic below is poorly implemented. Data reading should be directly based on curr_traj_data.
-        for modality in self.modality_keys:
-            # Get the data corresponding to each key in the modality
-            for key in self.modality_keys[modality]:
-                data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
+        data: dict = {}
+        self._set_curr_episode(trajectory_id)
+        modality_keys = self.modality_keys
+        get_data = self.get_data_by_modality
+        for modality, keys in modality_keys.items():
+            for key in keys:
+                data[key] = get_data(trajectory_id, modality, key, base_index)
         return data
 
-    def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
-        """Get the data for a trajectory."""
-        if self._lerobot_version == "v2.0":
-        
-            if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
-                return self.curr_traj_data
-            else:
-                chunk_index = self.get_episode_chunk(trajectory_id)
-                parquet_path = self.dataset_path / self.data_path_pattern.format(
-                    episode_chunk=chunk_index, episode_index=trajectory_id
-                )
-                assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-                return pd.read_parquet(parquet_path)
-        elif self._lerobot_version == "v3.0":
-            return self.get_trajectory_data_lerobot_v3(trajectory_id)
     
-    def get_trajectory_data_lerobot_v3(self, trajectory_id: int) -> pd.DataFrame:
-        """Get the data for a trajectory from lerobot v3."""
+    def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
+        """Get the data for a trajectory from lerobot v3 (official: slice of HF Dataset)."""
         if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
             return self.curr_traj_data
-        else: #TODO check detail later
-            chunk_index = self.get_episode_chunk(trajectory_id)
-
-            file_index = self.get_episode_file_index(trajectory_id)
-            # file_from_index = self.get_episode_file_from_index(trajectory_id)
-            
-            
-            parquet_path = self.dataset_path / self.data_path_pattern.format(
-                chunk_index=chunk_index, file_index=file_index
+        # Always use mapping to find correct row
+        row_idx = self._episode_index_to_row[trajectory_id]
+        ep = self.episodes_hf[row_idx]
+        from_index = int(ep["dataset_from_index"])
+        to_index = int(ep["dataset_to_index"])
+        
+        # Validate indices are within hf_dataset bounds
+        hf_len = len(self.hf_dataset)
+        if from_index < 0 or from_index >= hf_len or to_index > hf_len:
+            raise IndexError(
+                f"Episode {trajectory_id} has invalid indices: "
+                f"dataset_from_index={from_index}, dataset_to_index={to_index}, "
+                f"but hf_dataset has only {hf_len} frames. "
+                f"This may indicate data/episode metadata mismatch or file sorting issue."
             )
-            assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            file_data = pd.read_parquet(parquet_path)
-            
-            # filter by trajectory_id
-            episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
-            
-            # fix timestamp from epis index to file index
-            from_timestamp = self.trajectory_ids_to_metadata[trajectory_id]["videos/observation.images.wrist/from_timestamp"]
-            episode_data["timestamp"] = episode_data["timestamp"] + from_timestamp  
-            
-            return episode_data
+        
+        slice_ds = self.hf_dataset.select(range(from_index, to_index))
+        episode_data = slice_ds.to_pandas()
+        # Timestamps in data are relative to episode; add video from_timestamp for frame lookup
+        if getattr(self, "_detected_video_keys", None):
+            first_video_key = self._detected_video_keys[0]
+            from_ts_col = f"videos/{first_video_key}/from_timestamp"
+            if from_ts_col in ep:
+                from_ts = float(ep[from_ts_col])
+                if "timestamp" in episode_data.columns:
+                    ts = episode_data["timestamp"]
+                    # HF may store as list/array per row; flatten to 1d
+                    if hasattr(ts.iloc[0], "__len__") and not isinstance(ts.iloc[0], (str, bytes)):
+                        ts = np.array([float(x[0]) if len(x) else float(x) for x in ts])
+                    else:
+                        ts = ts.to_numpy().astype(np.float64)
+                    episode_data["timestamp"] = ts + from_ts
+        self.curr_traj_id = trajectory_id
+        self.curr_traj_data = episode_data
+        return episode_data
 
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
@@ -909,25 +915,93 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             int: The index of the trajectory in the dataset.
         """
-        trajectory_indices = np.where(self.trajectory_ids == trajectory_id)[0]
-        if len(trajectory_indices) != 1:
-            raise ValueError(
-                f"Error finding trajectory index for {trajectory_id}, found {trajectory_indices=}"
-            )
-        return trajectory_indices[0]
+        try:
+            return self._trajectory_id_to_index[trajectory_id]
+        except KeyError as exc:
+            raise ValueError(f"Error finding trajectory index for {trajectory_id}") from exc
 
     def get_episode_chunk(self, ep_index: int) -> int:
         """Get the chunk index for an episode index."""
-        return ep_index // self.chunk_size
-    def get_episode_file_index(self, ep_index: int) -> int:
-        """Get the file index for an episode index."""
-        episode_meta = self.trajectory_ids_to_metadata[ep_index]
-        return episode_meta["data/file_index"]
-    
-    def get_episode_file_from_index(self, ep_index: int) -> int:
-        """Get the file from index for an episode index."""
-        episode_meta = self.trajectory_ids_to_metadata[ep_index]
-        return episode_meta["data/file_from_index"]
+        row_idx = self._episode_index_to_row[ep_index]
+        return int(self.episodes_hf[row_idx]["data/chunk_index"])
+
+    def _set_curr_episode(self, trajectory_id: int) -> None:
+        """Cache episode metadata to avoid repeated lookups on hot paths."""
+        if self._curr_episode_id == trajectory_id:
+            return
+        row_idx = self._episode_index_to_row[trajectory_id]
+        ep = self.episodes_hf[row_idx]
+        self._curr_episode_id = trajectory_id
+        self._curr_row_idx = row_idx
+        self._curr_from_index = int(ep["dataset_from_index"])
+        self._curr_to_index = int(ep["dataset_to_index"])
+        self._curr_length = int(ep["length"])
+        self._curr_episode_row = ep
+
+    def _fetch_hf_column(
+        self,
+        column: str,
+        abs_indices: list[int] | np.ndarray,
+    ):
+        abs_indices_list = self._to_int_index_list(abs_indices)
+        if not abs_indices_list:
+            return []
+        return self.hf_dataset[abs_indices_list][column]
+
+    @staticmethod
+    def _to_int_index_list(abs_indices: list[int] | np.ndarray) -> list[int]:
+        if isinstance(abs_indices, np.ndarray):
+            if abs_indices.size == 0:
+                return []
+            return abs_indices.astype(np.int64, copy=False).reshape(-1).tolist()
+        if len(abs_indices) == 0:
+            return []
+        return [int(i) for i in abs_indices]
+
+    @staticmethod
+    def _to_float64_timestamps(ts_vals) -> np.ndarray:
+        ts_arr = np.asarray(ts_vals)
+        if ts_arr.ndim == 1 and np.issubdtype(ts_arr.dtype, np.number):
+            return ts_arr.astype(np.float64, copy=False)
+        if ts_arr.ndim == 2 and ts_arr.shape[1] == 1 and np.issubdtype(ts_arr.dtype, np.number):
+            return ts_arr[:, 0].astype(np.float64, copy=False)
+
+        if not isinstance(ts_vals, (list, tuple, np.ndarray)):
+            ts_vals = [ts_vals]
+        out = np.empty(len(ts_vals), dtype=np.float64)
+        for i, value in enumerate(ts_vals):
+            if isinstance(value, (list, tuple, np.ndarray)):
+                if len(value) == 0:
+                    out[i] = 0.0
+                    continue
+                value = value[0]
+            out[i] = float(value)
+        return out
+
+    @staticmethod
+    def _slice_state_action_rows(
+        column_vals,
+        start: int,
+        end: int,
+        expected_dim: int,
+    ) -> np.ndarray:
+        if len(column_vals) == 0:
+            return np.empty((0, expected_dim), dtype=np.float32)
+
+        vals_arr = np.asarray(column_vals)
+        if vals_arr.dtype != object:
+            if vals_arr.ndim == 2:
+                return vals_arr[:, start:end]
+            if vals_arr.ndim == 1:
+                return vals_arr.reshape(-1, 1)[:, start:end]
+
+        rows = []
+        for val in column_vals:
+            arr = np.asarray(val)
+            if arr.ndim == 0:
+                arr = arr.reshape(1)
+            rows.append(arr[start:end])
+        return np.stack(rows, axis=0)
 
 
     def retrieve_data_and_pad(
@@ -982,17 +1056,16 @@ class LeRobotSingleDataset(Dataset):
         original_key = self.lerobot_modality_meta.video[key].original_key
         if original_key is None:
             original_key = key
-        if self._lerobot_version == "v2.0":
-            video_filename = self.video_path_pattern.format(
-                episode_chunk=chunk_index, episode_index=trajectory_id, video_key=original_key
-            )
-        elif self._lerobot_version == "v3.0":
-            episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
-            video_filename = self.video_path_pattern.format(
-                video_key=original_key,
-                chunk_index=episode_meta["data/chunk_index"],
-                file_index=episode_meta["data/file_index"],
-            )
+        # Always use mapping to find correct row
+        row_idx = self._episode_index_to_row[trajectory_id]
+        ep = self.episodes_hf[row_idx]
+        vid_chunk_index = int(ep[f"videos/{original_key}/chunk_index"])
+        vid_file_index = int(ep[f"videos/{original_key}/file_index"])
+        video_filename = self.video_path_pattern.format(
+            video_key=original_key,
+            chunk_index=vid_chunk_index,
+            file_index=vid_file_index,
+        )
         return self.dataset_path / video_filename
 
     def get_video(
@@ -1012,31 +1085,50 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             np.ndarray: The video frames for the trajectory and frame indices. Shape: (T, H, W, C)
         """
-        # Get the step indices
-        step_indices = self.delta_indices[key] + base_index
-        # print(f"{step_indices=}")
-        # Get the trajectory index
-        trajectory_index = self.get_trajectory_index(trajectory_id)
-        # Ensure the indices are within the valid range
-        # This is equivalent to padding the video with extra frames at the beginning and end
-        step_indices = np.maximum(step_indices, 0)
-        step_indices = np.minimum(step_indices, self.trajectory_lengths[trajectory_index] - 1)
+        self._set_curr_episode(trajectory_id)
+        step_indices = np.asarray(self.delta_indices[key], dtype=np.int64) + int(base_index)
+        step_indices = np.clip(step_indices, 0, self._curr_length - 1)
         assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
-        # Get the sub-key
         key = key.replace("video.", "")
         video_path = self.get_video_path(trajectory_id, key)
-        # Get the action/state timestamps for each frame in the video
-        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
-        assert "timestamp" in self.curr_traj_data.columns, f"No timestamp found in {trajectory_id=}"
-        timestamp: np.ndarray = self.curr_traj_data["timestamp"].to_numpy()
-        # Get the corresponding video timestamps from the step indices
-        video_timestamp = timestamp[step_indices]
+        abs_indices = self._curr_from_index + step_indices
+        if "timestamp" not in self.hf_dataset.column_names:
+            raise KeyError(
+                f"No 'timestamp' column found in HF dataset for {self.dataset_name}. "
+                f"Available columns: {self.hf_dataset.column_names}"
+            )
+        ts_vals = self._fetch_hf_column("timestamp", abs_indices)
+        rel_ts = self._to_float64_timestamps(ts_vals)
+        original_key = self.lerobot_modality_meta.video[key].original_key
+        if original_key is None:
+            original_key = key
+        from_ts = 0.0
+        ep = self._curr_episode_row if self._curr_episode_row is not None else self.episodes_hf[self._curr_row_idx]
+        from_ts_col = f"videos/{original_key}/from_timestamp"
+        if from_ts_col in ep:
+            from_ts = float(ep[from_ts_col])
+        elif getattr(self, "_detected_video_keys", None):
+            fallback_key = self._detected_video_keys[0]
+            fallback_col = f"videos/{fallback_key}/from_timestamp"
+            if fallback_col in ep:
+                from_ts = float(ep[fallback_col])
+        video_timestamp = rel_ts + from_ts
+        # Build per-call kwargs so each dataset/video key uses its own fps parsed from info.json.
+        backend_kwargs = dict(self.video_backend_kwargs)
+        if self.video_backend == "decord":
+            fps = None
+            if key in self.metadata.modalities.video:
+                fps = self.metadata.modalities.video[key].fps
+            elif original_key in self.metadata.modalities.video:
+                fps = self.metadata.modalities.video[original_key].fps
+            if fps is not None:
+                backend_kwargs["fixed_fps"] = float(fps)
 
         return get_frames_by_timestamps(
             video_path.as_posix(),
             video_timestamp,
-            video_backend=self.video_backend, # TODO
-            video_backend_kwargs=self.video_backend_kwargs,
+            video_backend=self.video_backend,
+            video_backend_kwargs=backend_kwargs,
         )
 
     def get_state_or_action(
@@ -1061,41 +1153,40 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             np.ndarray: The data for the trajectory and step indices.
         """
-        # Get the step indices
-        step_indices = self.delta_indices[key] + base_index
-        # Get the trajectory index
-        trajectory_index = self.get_trajectory_index(trajectory_id)
-        # Get the maximum length of the trajectory
-        max_length = self.trajectory_lengths[trajectory_index]
+        self._set_curr_episode(trajectory_id)
+        step_indices = np.asarray(self.delta_indices[key], dtype=np.int64) + int(base_index)
+        max_length = self._curr_length
         assert key.startswith(modality + "."), f"{key} must start with {modality + '.'}, got {key}"
-        # Get the sub-key, e.g. state.joint_angles -> joint_angles
         key = key.replace(modality + ".", "")
-        # Get the lerobot key
         le_state_or_action_cfg = getattr(self.lerobot_modality_meta, modality)
         le_key = le_state_or_action_cfg[key].original_key
         if le_key is None:
             le_key = key
-        # Get the data array, shape: (T, D)
-        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
-        assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
-        data_array: np.ndarray = np.stack(self.curr_traj_data[le_key])  # type: ignore
-        assert data_array.ndim == 2, f"Expected 2D array, got key {le_key} is{data_array.shape} array"
-        le_indices = np.arange(
-            le_state_or_action_cfg[key].start,
-            le_state_or_action_cfg[key].end,
-        )
-        data_array = data_array[:, le_indices]
-        # Get the state or action configuration
+        le_start = le_state_or_action_cfg[key].start
+        le_end = le_state_or_action_cfg[key].end
+        feature_dim = le_end - le_start
         state_or_action_cfg = getattr(self.metadata.modalities, modality)[key]
+        padding_strategy = "first_last" if state_or_action_cfg.absolute else "zero"
 
-        # Pad the data
-        return self.retrieve_data_and_pad(
-            array=data_array,
-            step_indices=step_indices,
-            max_length=max_length,
-            padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
-            # padding_strategy="zero",           # HACK for realdata
-        )
+        if padding_strategy == "first_last":
+            clamped_step = np.clip(step_indices, 0, max_length - 1)
+            target_abs = self._curr_from_index + clamped_step
+            unique_abs, inverse = np.unique(target_abs, return_inverse=True)
+            unique_vals = self._fetch_hf_column(le_key, unique_abs)
+            unique_rows = self._slice_state_action_rows(unique_vals, le_start, le_end, feature_dim)
+            return unique_rows[inverse]
+
+        valid_mask = np.logical_and(step_indices >= 0, step_indices < max_length)
+        if not np.any(valid_mask):
+            return np.zeros((len(step_indices), feature_dim), dtype=np.float32)
+
+        valid_abs = self._curr_from_index + step_indices[valid_mask]
+        unique_abs, inverse = np.unique(valid_abs, return_inverse=True)
+        unique_vals = self._fetch_hf_column(le_key, unique_abs)
+        unique_rows = self._slice_state_action_rows(unique_vals, le_start, le_end, feature_dim)
+        output = np.zeros((len(step_indices), unique_rows.shape[-1]), dtype=unique_rows.dtype)
+        output[valid_mask] = unique_rows[inverse]
+        return output
 
     def get_language(
         self,
@@ -1114,18 +1205,16 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             list[str]: The annotation data for the trajectory and step indices. If no matching data is found, return empty strings.
         """
-        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        self._set_curr_episode(trajectory_id)
         # Get the step indices
         step_indices = self.delta_indices[key] + base_index
-        # Get the trajectory index
-        trajectory_index = self.get_trajectory_index(trajectory_id)
         # Get the maximum length of the trajectory
-        max_length = self.trajectory_lengths[trajectory_index]
+        max_length = self._curr_length
         # Get the end times corresponding to the closest indices
         step_indices = np.maximum(step_indices, 0)
         step_indices = np.minimum(step_indices, max_length - 1)
         # Get the annotations
-        task_indices: list[int] = []
+        task_indices: list[int | None] = []
         assert key.startswith(
             "annotation."
         ), f"Language key must start with 'annotation.', got {key}"
@@ -1139,12 +1228,26 @@ class LeRobotSingleDataset(Dataset):
         original_key = subkey_meta.original_key
         if original_key is None:
             original_key = key
-        for i in range(len(step_indices)): # 
-            # task_indices.append(self.curr_traj_data[original_key][step_indices[i]].item())
-            value = self.curr_traj_data[original_key].iloc[step_indices[i]] # TODO check v2.0 
-            task_indices.append(value if isinstance(value, (int, float)) else value.item())
+        abs_indices = self._curr_from_index + step_indices
+        abs_indices_list = [int(i) for i in np.asarray(abs_indices).tolist()]
+        task_vals = self._fetch_hf_column(
+            original_key,
+            abs_indices_list,
+        )
+        if not isinstance(task_vals, (list, tuple, np.ndarray)):
+            task_vals = [task_vals]
+        for value in task_vals:
+            if isinstance(value, (list, tuple, np.ndarray)):
+                if len(value) == 0:
+                    task_indices.append(None)
+                    continue
+                value = value[0]
+            try:
+                task_indices.append(int(value))
+            except Exception:
+                task_indices.append(None)
 
-        return self.tasks.loc[task_indices]["task"].tolist()
+        return [self._task_index_to_task.get(i, "") if i is not None else "" for i in task_indices]
 
     def get_data_by_modality(
         self,
@@ -1166,11 +1269,24 @@ class LeRobotSingleDataset(Dataset):
             base_index (int): The base index of the trajectory.
         """
         if modality == "video":
-            return self.get_video(trajectory_id, key, base_index)
+            return self.get_video(
+                trajectory_id,
+                key,
+                base_index,
+            )
         elif modality == "state" or modality == "action":
-            return self.get_state_or_action(trajectory_id, modality, key, base_index)
+            return self.get_state_or_action(
+                trajectory_id,
+                modality,
+                key,
+                base_index,
+            )
         elif modality == "language":
-            return self.get_language(trajectory_id, key, base_index)
+            return self.get_language(
+                trajectory_id,
+                key,
+                base_index,
+            )
         else:
             raise ValueError(f"Invalid modality: {modality}")
 
@@ -1327,7 +1443,12 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         self.cached_frames = cached_frames
         self.start_indices = np.cumsum(self.trajectory_lengths) - self.trajectory_lengths
 
-    def get_video(self, trajectory_id: int, key: str, base_index: int) -> np.ndarray:
+    def get_video(
+        self,
+        trajectory_id: int,
+        key: str,
+        base_index: int,
+    ) -> np.ndarray:
         step_indices = self.delta_indices[key] + base_index
         # Get the trajectory index
         trajectory_index = self.get_trajectory_index(trajectory_id)
@@ -1342,7 +1463,11 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         absolute_indices = self.start_indices[trajectory_index] + step_indices
         return self.cached_frames[key][absolute_indices]
 
-    def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
+    def get_step_data(
+        self,
+        trajectory_id: int,
+        base_index: int,
+    ) -> dict:
         """Get the RAW data for a single step. No transforms are applied.
 
         Args:
@@ -1353,12 +1478,17 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
             dict: The data for the step.
         """
         data = {}
-        self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        self._set_curr_episode(trajectory_id)
         # Get the data for all modalities
         for modality in self.modality_keys:
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
-                data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
+                data[key] = self.get_data_by_modality(
+                    trajectory_id,
+                    modality,
+                    key,
+                    base_index,
+                )
         return data
 
     def set_transforms_metadata(self, metadata: DatasetMetadata):
@@ -1495,7 +1625,6 @@ class LeRobotMixtureDataset(Dataset):
         data_mixture: Sequence[tuple[LeRobotSingleDataset, float]],
         mode: str,
         balance_dataset_weights: bool = True,
-        balance_trajectory_weights: bool = True,
         seed: int = 42,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
@@ -1509,7 +1638,6 @@ class LeRobotMixtureDataset(Dataset):
             data_mixture (list[tuple[LeRobotSingleDataset, float]]): Datasets and their corresponding weights.
             mode (str): If "train", __getitem__ will return different samples every epoch; if "val" or "test", __getitem__ will return the same sample every epoch.
             balance_dataset_weights (bool): If True, the weight of dataset will be multiplied by the total trajectory length of each dataset.
-            balance_trajectory_weights (bool): If True, sample trajectories within a dataset weighted by their length; otherwise, use equal weighting.
             seed (int): Random seed for sampling.
         """
         datasets: list[LeRobotSingleDataset] = []
@@ -1527,7 +1655,6 @@ class LeRobotMixtureDataset(Dataset):
         
         self.datasets = datasets
         self.balance_dataset_weights = balance_dataset_weights
-        self.balance_trajectory_weights = balance_trajectory_weights
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
@@ -1560,30 +1687,7 @@ class LeRobotMixtureDataset(Dataset):
         else:
             self._dataset_sampling_weights /= weights_sum
 
-        # 3. Trajectory sampling weights
-        self._trajectory_sampling_weights: list[np.ndarray] = []
-        for i, dataset in enumerate(self.datasets):
-            trajectory_sampling_weights = np.ones(len(dataset.trajectory_lengths))
-            if self.balance_trajectory_weights:
-                trajectory_sampling_weights *= dataset.trajectory_lengths
-            
-            # Check for zero or negative weights before normalization
-            if np.any(trajectory_sampling_weights <= 0):
-                print(f"Warning: Dataset {i} has zero or negative trajectory weights")
-                trajectory_sampling_weights = np.maximum(trajectory_sampling_weights, 1e-8)
-            
-            # Normalize weights
-            weights_sum = trajectory_sampling_weights.sum()
-            if weights_sum == 0 or np.isnan(weights_sum):
-                print(f"Error: Dataset {i} has invalid trajectory weights sum: {weights_sum}")
-                # Fallback to equal weights
-                trajectory_sampling_weights = np.ones(len(dataset.trajectory_lengths)) / len(dataset.trajectory_lengths)
-            else:
-                trajectory_sampling_weights /= weights_sum
-            
-            self._trajectory_sampling_weights.append(trajectory_sampling_weights)
-
-        # 4. Primary dataset indices
+        # 3. Primary dataset indices
         self._primary_dataset_indices = np.array(dataset_sampling_weights) == 1.0
         if not np.any(self._primary_dataset_indices):
             print(f"Warning: No dataset with weight 1.0 found. Original weights: {dataset_sampling_weights}")
@@ -1614,11 +1718,6 @@ class LeRobotMixtureDataset(Dataset):
         return self._dataset_sampling_weights
 
     @property
-    def trajectory_sampling_weights(self) -> list[np.ndarray]:
-        """The sampling weights for each trajectory in each dataset."""
-        return self._trajectory_sampling_weights
-
-    @property
     def primary_dataset_indices(self) -> np.ndarray:
         """The indices of the primary datasets."""
         return self._primary_dataset_indices
@@ -1643,28 +1742,22 @@ class LeRobotMixtureDataset(Dataset):
         # self.sampled_steps = self.sample_epoch()
 
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
-        """Sample a single step from the dataset."""
-        # return self.sampled_steps[index]
-
+        """Sample a single step from the dataset.
+        
+        Uses uniform sampling across all steps via hf_dataset absolute index,
+        following the official LeRobot v3 approach.
+        """
         # Set seed
         seed = index if self.mode != "train" else safe_hash((self.epoch, index, self.seed))
         rng = np.random.default_rng(seed)
 
-        # Sample dataset
+        # Sample dataset based on dataset_sampling_weights
         dataset_index = rng.choice(len(self.datasets), p=self.dataset_sampling_weights)
         dataset = self.datasets[dataset_index]
 
-        # Sample trajectory
-        # trajectory_index = rng.choice(
-        #     len(dataset.trajectory_ids), p=self.trajectory_sampling_weights[dataset_index]
-        # )
-        # trajectory_id = dataset.trajectory_ids[trajectory_index]
-
-        # # Sample step
-        # base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
-        # return dataset, trajectory_id, base_index
-        single_step_index = rng.choice(len(dataset.all_steps))
-        trajectory_id, base_index = dataset.all_steps[single_step_index]
+        # Sample abs index uniformly from hf_dataset, then map to (trajectory_id, base_index)
+        abs_idx = rng.integers(0, len(dataset))
+        trajectory_id, base_index = dataset.abs_index_to_episode_step(abs_idx)
         return dataset, trajectory_id, base_index
 
     def __getitem__(self, index: int) -> dict:
@@ -1928,8 +2021,18 @@ class LeRobotMixtureDataset(Dataset):
         metadatas: list[DatasetMetadata],
         dataset_sampling_weights: list[float],
         percentile_mixing_method: str,
+        used_keys: dict[str, set[str]] | None = None,
     ) -> DatasetMetadata:
-        """Merge multiple metadata into one."""
+        """Merge multiple metadata into one.
+        
+        Args:
+            metadatas: List of DatasetMetadata objects to merge.
+            dataset_sampling_weights: Weights for each dataset when computing statistics.
+            percentile_mixing_method: Method for mixing percentiles ("weighted_average" or "min_max").
+            used_keys: Optional dict mapping modality names to sets of keys actually used in training.
+                       If provided, only these keys will be included in the merged metadata.
+                       Example: {"video": {"primary_view"}, "state": {"eef_position", "gripper"}}
+        """
         # Convert to dicts
         metadata_dicts = [metadata.model_dump(mode="json") for metadata in metadatas]
         # Create a new metadata dict
@@ -1962,11 +2065,28 @@ class LeRobotMixtureDataset(Dataset):
                 modality_configs[modality].add(json.dumps(configs))
         merged_metadata["modalities"] = {}
         for modality, configs in modality_configs.items():
-            # Check that all modality configs correspond to the same tag matches
-            assert (
-                len(configs) == 1
-            ), f"Multiple modality configs for modality {modality}: {list(configs)}"
-            merged_metadata["modalities"][modality] = json.loads(configs.pop())
+            # Get the set of used keys for this modality (if filtering is enabled)
+            modality_used_keys = used_keys.get(modality) if used_keys else None
+            
+            if modality == "video":
+                # Union all video configs - different datasets may have different views
+                # Video resolution is overridden by img_resize anyway, and fps is never used
+                merged_video = {}
+                for config_json in configs:
+                    config_dict = json.loads(config_json)
+                    for video_key, video_meta in config_dict.items():
+                        # Filter by used_keys if provided
+                        if modality_used_keys is not None and video_key not in modality_used_keys:
+                            continue
+                        if video_key not in merged_video:
+                            merged_video[video_key] = video_meta
+                merged_metadata["modalities"][modality] = merged_video
+            else:
+                # For state/action, require strict consistency
+                assert (
+                    len(configs) == 1
+                ), f"Multiple modality configs for modality {modality}: {list(configs)}"
+                merged_metadata["modalities"][modality] = json.loads(configs.pop())
 
         return DatasetMetadata.model_validate(merged_metadata)
 
@@ -1992,17 +2112,42 @@ class LeRobotMixtureDataset(Dataset):
 
         self.tag = EmbodimentTag.NEW_EMBODIMENT.value
         self.merged_metadata: dict[str, DatasetMetadata] = {}
-        # Group metadata by tag
-        all_metadatas: dict[str, list[DatasetMetadata]] = {}
+        
+        # Collect all used keys from all datasets' modality_configs
+        all_used_keys: dict[str, set[str]] = {}
         for dataset in self.datasets:
+            if hasattr(dataset, 'modality_configs') and dataset.modality_configs:
+                for modality, config in dataset.modality_configs.items():
+                    if hasattr(config, 'modality_keys'):
+                        if modality not in all_used_keys:
+                            all_used_keys[modality] = set()
+                        for full_key in config.modality_keys:
+                            # Extract subkey from full key (e.g., "state.eef_position" -> "eef_position")
+                            parts = full_key.split(".", 1)
+                            if len(parts) == 2:
+                                all_used_keys[modality].add(parts[1])
+                            else:
+                                all_used_keys[modality].add(full_key)
+        
+        # Group metadata and weights by tag
+        # Fix: Each tag should only use weights from datasets belonging to that tag
+        all_metadatas: dict[str, list[DatasetMetadata]] = {}
+        all_weights_by_tag: dict[str, list[float]] = {}
+        for idx, dataset in enumerate(self.datasets):
             if dataset.tag not in all_metadatas:
                 all_metadatas[dataset.tag] = []
+                all_weights_by_tag[dataset.tag] = []
             all_metadatas[dataset.tag].append(dataset.metadata)
+            all_weights_by_tag[dataset.tag].append(self.dataset_sampling_weights[idx])
+        
         for tag, metadatas in all_metadatas.items():
+            # Use only the weights corresponding to datasets in this tag
+            tag_weights = all_weights_by_tag[tag]
             self.merged_metadata[tag] = self.merge_metadata(
                 metadatas=metadatas,
-                dataset_sampling_weights=self.dataset_sampling_weights.tolist(),
+                dataset_sampling_weights=tag_weights,
                 percentile_mixing_method=metadata_config["percentile_mixing_method"],
+                used_keys=all_used_keys if all_used_keys else None,
             )
         for dataset in self.datasets:
             dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
@@ -2220,5 +2365,3 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
-

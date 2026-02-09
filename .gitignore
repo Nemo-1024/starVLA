@@ -30,7 +30,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
+logs
+wandb
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -150,7 +151,6 @@ dmypy.json
 
 # Caches and Datasets
 cache/
-data/
 playground/Models
 =4.43.2
 
@@ -160,7 +160,7 @@ playground/BuildData
 playground/Checkpoints
 playground/Pretrained_models
 playground/Datasets
-
+playground/demo_data
 eval/SimplerEnv
 
 results
@@ -221,3 +221,5 @@ examples/Robotwin/train_files/submit_robotwin_training.sh
 starVLA/dataloader/gr00t_lerobot/datasets_temp.py
 MUJOCO_LOG.TXT
 examples/MultiRobot/*
+.hf_cache/
+checkpoints

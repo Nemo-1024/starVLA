@@ -21,7 +21,10 @@ class EmbodimentTag(Enum):
     """
     The GR1 dataset.
     """
-
+    AGILEX = "agilex"
+    """
+    The Agilex dataset.
+    """
     OXE_DROID = "oxe_droid"
     """
     The OxE Droid dataset.
@@ -51,7 +54,14 @@ class EmbodimentTag(Enum):
     """
     The Franka Emika Panda robot.
     """
-
+    FRANKA_FR3_DUAL = 'franka_fr3_dual'
+    """
+    The Dual Franka Emika Panda robot.
+    """
+    UR = 'ur'
+    """
+    The Universal Robots UR1 robot.
+    """
 # Embodiment tag string: to projector index in the Action Expert Module
 EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.NEW_EMBODIMENT.value: 31,
@@ -61,15 +71,24 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.AGIBOT_GENIE1.value: 26,
     EmbodimentTag.GR1.value: 24,
     EmbodimentTag.FRANKA.value: 25,
+    EmbodimentTag.AGILEX.value: 32,
+    EmbodimentTag.FRANKA_FR3_DUAL.value: 33,
+    EmbodimentTag.UR.value: 34,
 }
 
 # Robot type to embodiment tag mapping
 ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "libero_franka": EmbodimentTag.FRANKA,
-    "oxe_droid": EmbodimentTag.OXE_DROID,
-    "oxe_bridge": EmbodimentTag.OXE_BRIDGE,
+    "droid": EmbodimentTag.OXE_DROID,
+    "bridge": EmbodimentTag.OXE_BRIDGE,
     "oxe_rt1": EmbodimentTag.OXE_RT1,
     "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
     "fourier_gr1_arms_waist": EmbodimentTag.GR1,
+    "agibot_genie": EmbodimentTag.AGIBOT_GENIE1,
+    "robomind_franka_1rgb": EmbodimentTag.FRANKA,
+    "robomind_franka_3rgb": EmbodimentTag.FRANKA,
+    "robomind_franka_fr3_dual": EmbodimentTag.FRANKA_FR3_DUAL,
+    "robomind_ur_1rgb": EmbodimentTag.UR,
+    "agilex": EmbodimentTag.AGILEX,
 }

@@ -20,23 +20,78 @@ DATASET_NAMED_MIXTURES = {
         ("custom_dataset_name_2", 1.0, "custom_robot_config"),
     ],
 
-    "libero_all": [
-        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
-        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
-        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
-        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+    "libero": [
+        # ("libero_object_image", 1.0, "libero_franka"),
+        # ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        # ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+        # ("libero_10_image", 1.0, "libero_franka"),
+        # ("libero", 1.0, "libero_franka"),
+        ("libero", 1.0, "libero_franka"),
                 # ("libero_90_no_noops_lerobot", 1.0, "libero_franka"),
     ],
+    "test": [
+        ("bread_in_basket_with_delta_action", 1.0, "robomind_franka_1rgb"),
+    ],
+    "agibot": [
+        ("AgiBot_merge", 1.0, "agibot_genie"),
+    ],
     "bridge": [
-        ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),
+        ("bridge_v2_lerobot", 1.0, "bridge"),
+    ],
+    "droid": [
+        ("droid_1.0.1", 1.0, "droid"),
     ],
     "bridge_rt_1": [
         ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),
         ("fractal20220817_data_0.1.0_lerobot", 1.0, "oxe_rt1"),
     ],
-
+    
+    # RoboMIND datasets
+    "robomind_franka_1rgb": [
+        ("robomind_franka_1rgb", 1.0, "robomind_franka_1rgb"),
+    ],
+    "robomind_franka_1rgb_delta_action": [
+        ("robomind_franka_1rgb_delta_action", 1.0, "robomind_franka_1rgb"),
+    ],
+    "robomind_franka_3rgb": [
+        ("robomind_franka_3rgb", 1.0, "robomind_franka_3rgb"),
+    ],
+    "robomind_franka_3rgb_delta_action": [
+        ("robomind_franka_3rgb_delta_action", 1.0, "robomind_franka_3rgb"),
+    ],
+    "robomind_franka_fr3_dual": [
+        ("robomind_franka_fr3_dual", 1.0, "robomind_franka_fr3_dual"),
+    ],
+    "robomind_agilex_3rgb": [
+        ("robomind_agilex_3rgb", 1.0, "agilex"),
+    ],
+    "robomind_ur_1rgb": [
+        ("robomind_ur_1rgb", 1.0, "robomind_ur_1rgb"),
+    ],
+    "robomind_ur_1rgb_delta_action": [
+        ("robomind_ur_1rgb_delta_action", 1.0, "robomind_ur_1rgb"),
+    ],
+    "robomind_all": [
+        ("robomind_franka_1rgb_delta_action", 1.0, "robomind_franka_1rgb"),
+        ("robomind_franka_3rgb_delta_action", 1.0, "robomind_franka_3rgb"),
+        # ("robomind_franka_fr3_dual", 1.0, "robomind_franka_fr3_dual"),
+        # ("robomind_agilex_3rgb", 1.0, "agilex"),
+        ("robomind_ur_1rgb_delta_action", 1.0, "robomind_ur_1rgb"),
+    ],
+    "lam":[
+        ("libero", 1.0, "libero_franka"),
+        # ("bridge_v2_lerobot", 1.0, "bridge"),
+        ("droid_1.0.1", 0.3, "droid"),
+        ("AgiBot_merge", 1.0, "agibot_genie"),
+        ("robomind_franka_1rgb_delta_action", 1.0, "robomind_franka_1rgb"),
+        ("robomind_franka_3rgb_delta_action", 1.0, "robomind_franka_3rgb"),
+        ("robomind_ur_1rgb_delta_action", 1.0, "robomind_ur_1rgb"),
+    ],
     "demo_sim_pick_place": [
-        ("sim_pick_place", 1.0, "demo_sim_franka_delta_joints"),
+        # ("sim_pick_place", 1.0, "demo_sim_franka_delta_joints"),
+        ("libero", 1.0, "libero_franka"),
+        # ("bridge_orig_lerobot", 1.0, "oxe_bridge"),
+        # ("libero_10_image", 1.0, "libero_franka"),
     ],
 
     "custom_dataset": [

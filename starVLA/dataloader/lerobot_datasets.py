@@ -20,7 +20,6 @@ def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,
     robot_type: str,
-    delete_pause_frame: bool = False,
     data_cfg: dict | None = None,
 ) -> LeRobotSingleDataset:
     """
@@ -51,7 +50,6 @@ def make_LeRobotSingleDataset(
         transforms=transforms,
         embodiment_tag=embodiment_tag,
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
-        delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
     )
 
@@ -59,7 +57,6 @@ def get_vla_dataset(
     data_cfg: dict,
     mode: str = "train",
     balance_dataset_weights: bool = False,
-    balance_trajectory_weights: bool = False,
     seed: int = 42,
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
@@ -68,7 +65,6 @@ def get_vla_dataset(
     """
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
-    delete_pause_frame = data_cfg.get("delete_pause_frame", False)
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight, robot_type in mixture_spec:  
@@ -82,13 +78,12 @@ def get_vla_dataset(
 
     dataset_mixture = []
     for d_name, d_weight, robot_type in filtered_mixture_spec:
-        dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, delete_pause_frame=delete_pause_frame, data_cfg=data_cfg), d_weight))
+        dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, data_cfg=data_cfg), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,
         mode=mode,
         balance_dataset_weights=balance_dataset_weights,
-        balance_trajectory_weights=balance_trajectory_weights,
         seed=seed,
         data_cfg=data_cfg,
         **kwargs,
