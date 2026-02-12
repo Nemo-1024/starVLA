@@ -62,8 +62,13 @@ class EmbodimentTag(Enum):
     """
     The Universal Robots UR1 robot.
     """
+    HUMAN = "human"
+    """
+    Human first-person egocentric embodiment.
+    """
 # Embodiment tag string: to projector index in the Action Expert Module
 EMBODIMENT_TAG_MAPPING = {
+    EmbodimentTag.HUMAN.value: 0,
     EmbodimentTag.NEW_EMBODIMENT.value: 31,
     EmbodimentTag.OXE_DROID.value: 17,
     EmbodimentTag.OXE_BRIDGE.value: 18,
@@ -91,4 +96,5 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "robomind_franka_fr3_dual": EmbodimentTag.FRANKA_FR3_DUAL,
     "robomind_ur_1rgb": EmbodimentTag.UR,
     "agilex": EmbodimentTag.AGILEX,
+    "human": EmbodimentTag.HUMAN,
 }

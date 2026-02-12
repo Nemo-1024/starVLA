@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../UniVLA"
+		},
+		{
+			"path": "../Isaac-GR00T"
+		}
+	],
+	"settings": {
+		"chatgpt.openOnStartup": true
+	}
+}

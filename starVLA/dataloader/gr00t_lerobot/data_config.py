@@ -1373,6 +1373,72 @@ class RoboMINDUR1RGBDataConfig:
         return ComposedModalityTransform(transforms=transforms)
 
 
+
+
+###########################################################################################
+
+
+class HumanVideoDataConfig:
+    """Configuration aligned with LeRobot modality keys used by epic_kitchens_100_lerobot."""
+
+    video_keys = [
+        "video.primary_view",
+    ]
+    state_keys = [
+        "state.dummy_state",
+    ]
+    action_keys = [
+        "action.dummy_action",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    action_indices = list(range(16))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.dummy_state": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.dummy_action": "min_max",
+                },
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+
 ###########################################################################################
 
 
@@ -1390,9 +1456,9 @@ ROBOT_TYPE_CONFIG_MAP = {
     "robomind_franka_3rgb": RoboMINDFranka3RGBDataConfig(),
     "robomind_franka_fr3_dual": RoboMINDFrankaFR3DualDataConfig(),
     "robomind_ur_1rgb": RoboMINDUR1RGBDataConfig(),
+    "human": HumanVideoDataConfig(),
     "custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig(),
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
     
     "custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig(),
 }
-

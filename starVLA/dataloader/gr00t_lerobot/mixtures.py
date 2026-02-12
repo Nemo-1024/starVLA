@@ -26,7 +26,7 @@ DATASET_NAMED_MIXTURES = {
         # ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
         # ("libero_10_image", 1.0, "libero_franka"),
         # ("libero", 1.0, "libero_franka"),
-        ("libero", 1.0, "libero_franka"),
+        ("libero_10", 1.0, "libero_franka"),
                 # ("libero_90_no_noops_lerobot", 1.0, "libero_franka"),
     ],
     "test": [
@@ -86,6 +86,18 @@ DATASET_NAMED_MIXTURES = {
         ("robomind_franka_1rgb_delta_action", 1.0, "robomind_franka_1rgb"),
         ("robomind_franka_3rgb_delta_action", 1.0, "robomind_franka_3rgb"),
         ("robomind_ur_1rgb_delta_action", 1.0, "robomind_ur_1rgb"),
+    ],
+    "human_ego_only": [
+        ("epic_kitchens_100_lerobot", 1.0, "human"),
+    ],
+    "lam_plus_human": [
+        ("libero", 1.0, "libero_franka"),
+        ("droid_1.0.1", 0.3, "droid"),
+        ("AgiBot_merge", 1.0, "agibot_genie"),
+        ("robomind_franka_1rgb_delta_action", 1.0, "robomind_franka_1rgb"),
+        ("robomind_franka_3rgb_delta_action", 1.0, "robomind_franka_3rgb"),
+        ("robomind_ur_1rgb_delta_action", 1.0, "robomind_ur_1rgb"),
+        ("epic_kitchens_100_lerobot", 0.3, "human"),
     ],
     "demo_sim_pick_place": [
         # ("sim_pick_place", 1.0, "demo_sim_franka_delta_joints"),
