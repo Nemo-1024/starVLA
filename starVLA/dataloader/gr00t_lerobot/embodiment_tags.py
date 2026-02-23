@@ -76,9 +76,9 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.AGIBOT_GENIE1.value: 26,
     EmbodimentTag.GR1.value: 24,
     EmbodimentTag.FRANKA.value: 25,
-    EmbodimentTag.AGILEX.value: 32,
-    EmbodimentTag.FRANKA_FR3_DUAL.value: 33,
-    EmbodimentTag.UR.value: 34,
+    EmbodimentTag.AGILEX.value: 1,
+    EmbodimentTag.FRANKA_FR3_DUAL.value: 2,
+    EmbodimentTag.UR.value: 3,
 }
 
 # Robot type to embodiment tag mapping
@@ -87,6 +87,7 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "droid": EmbodimentTag.OXE_DROID,
     "bridge": EmbodimentTag.OXE_BRIDGE,
     "oxe_rt1": EmbodimentTag.OXE_RT1,
+    "fractal": EmbodimentTag.OXE_RT1,
     "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
     "fourier_gr1_arms_waist": EmbodimentTag.GR1,

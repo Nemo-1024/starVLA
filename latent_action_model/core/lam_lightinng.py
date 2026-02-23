@@ -1,4 +1,5 @@
 from typing import Dict, Tuple, Optional, Callable, Iterable, Any, List
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +19,11 @@ import os
 import shutil
 from .utils.utils import eef_reconstruction_loss, charbonnier_loss
 import importlib
-from ..data_loader.video_aug import gpu_two_view_video_aug
+from ..data_loader.video_aug import (
+    LAM_IMAGE_HW,
+    LAM_PATCH_SIZE,
+    gpu_two_view_video_aug,
+)
 
 
 class VJEPA_LAM(LightningModule):
@@ -41,13 +46,13 @@ class VJEPA_LAM(LightningModule):
         max_state_dim: int = 32,
         num_frames: int = 5,
         num_queries: int = 1,
-        ar_prediction: bool = False,
         vq_kwargs: Optional[Dict[str, Any]] = None,
         dec_layers: int = 4,
         dropout: float = 0.1,
         # 物理接地参数
         lambda_aux: float = 0.2,  # 辅助损失的总体权重
         loss_type: str = "l1",
+        state_loss_type: str = "l1",
         # 训练参数
         project: str = 'UniVLA-latent_action_model',
         task_name: str = 'vjepa_lam',
@@ -69,6 +74,10 @@ class VJEPA_LAM(LightningModule):
         enc_modal_mask: bool = False,
         latent_layer_to_use: Any = 23,
         multi_input: bool = False,
+        num_embodiments: int = 32,
+        image_hw: Tuple[int, int] = LAM_IMAGE_HW,
+        patch_size: int = LAM_PATCH_SIZE,
+        image_aug: bool = True,
         **kwargs
     ):
         super().__init__()
@@ -77,6 +86,19 @@ class VJEPA_LAM(LightningModule):
 
         # 保存超参数
         self.save_hyperparameters()
+        self.image_hw = (int(image_hw[0]), int(image_hw[1]))
+        self.patch_size = int(patch_size)
+        self.image_aug = image_aug
+        if self.image_hw != LAM_IMAGE_HW:
+            raise ValueError(
+                f"Unsupported LAM image_hw={self.image_hw}. "
+                f"Only {LAM_IMAGE_HW} is supported in this branch."
+            )
+        if self.patch_size != LAM_PATCH_SIZE:
+            raise ValueError(
+                f"Unsupported LAM patch_size={self.patch_size}. "
+                f"Only {LAM_PATCH_SIZE} is supported in this branch."
+            )
         
         # 初始化 LAM 模型
         self.lam = LatentLAMModel(
@@ -88,7 +110,6 @@ class VJEPA_LAM(LightningModule):
             code_dim=code_dim,
             num_frames=num_frames,
             num_queries=num_queries,
-            ar_prediction=ar_prediction,
             dec_layers=dec_layers,
             dropout=dropout,
             vision_model_id=vision_model_id,
@@ -101,7 +122,10 @@ class VJEPA_LAM(LightningModule):
             enc_modal_mask=enc_modal_mask,
             latent_layer_to_use=latent_layer_to_use,
             multi_input=multi_input,
-            max_state_dim=max_state_dim
+            max_state_dim=max_state_dim,
+            num_embodiments=num_embodiments,
+            image_hw=self.image_hw,
+            patch_size=self.patch_size,
         )
 
 
@@ -124,6 +148,11 @@ class VJEPA_LAM(LightningModule):
             wandb.init(project=project, name=task_name, reinit=True, mode="offline" if wandb_offline else "online")
 
         self.loss_type = loss_type
+        if state_loss_type not in {"l1", "l2"}:
+            raise ValueError(f"Unsupported state_loss_type: {state_loss_type}")
+        self.state_loss_type = state_loss_type
+        # Run expensive unused-params scan only once at training start.
+        self._unused_params_scanned = False
     def shared_step(self, batch: Dict) -> Tuple[Tensor, Dict]:
         """共享的训练/验证步骤（训练分支）。"""
         return self._compute_step(batch=batch, vq_training=True)
@@ -189,7 +218,7 @@ class VJEPA_LAM(LightningModule):
         view2_by_index: Dict[int, torch.Tensor] = {}
         for items in groups.values():
             group_batch = torch.stack([clip for _, clip in items], dim=0).contiguous()
-            video1, video2 = gpu_two_view_video_aug(group_batch, training=training)
+            video1, video2 = gpu_two_view_video_aug(group_batch, output_size=self.image_hw, training=training)
             for pos, (orig_idx, _) in enumerate(items):
                 view1_by_index[orig_idx] = video1[pos]
                 view2_by_index[orig_idx] = video2[pos]
@@ -204,13 +233,17 @@ class VJEPA_LAM(LightningModule):
         if not isinstance(batch, dict) or "videos" not in batch:
             return batch
 
-        training_aug = bool(self.training)
+        training_aug = bool(self.training) and self.image_aug
         videos = batch["videos"]
 
         if isinstance(videos, torch.Tensor):
             if videos.ndim == 5 and (videos.shape[-1] == 3 or videos.shape[2] == 3):
                 videos_nhwc = self._as_nhwc_uint8_batch(videos)
-                video1, video2 = gpu_two_view_video_aug(videos_nhwc, training=training_aug)
+                video1, video2 = gpu_two_view_video_aug(
+                    videos_nhwc,
+                    output_size=self.image_hw,
+                    training=training_aug,
+                )
                 batch["videos"] = video1
                 batch["dec_videos"] = video2
             elif "dec_videos" not in batch:
@@ -228,28 +261,6 @@ class VJEPA_LAM(LightningModule):
 
         raise TypeError(f"Unsupported 'videos' type in batch: {type(videos)!r}")
     
-    def _detect_robot_data(self, states: torch.Tensor, threshold: float = 1e-6) -> torch.Tensor:
-        """
-        自动检测哪些样本包含有效的机械臂状态数据
-        
-        通过判断状态数据是否为零来区分机械臂数据和人类数据。
-        人类数据的状态会在数据处理阶段被填充为零。
-        
-        Args:
-            states: [B, T, state_dim] 状态张量
-            threshold: 判断状态是否为零的阈值
-            
-        Returns:
-            torch.Tensor: 包含机械臂数据的样本索引
-        """
-        # 计算每个样本在所有时间步和状态维度上的绝对值之和
-        state_magnitudes = torch.sum(torch.abs(states), dim=(1, 2))  # [B]
-        
-        # 找到状态幅度大于阈值的样本（即非零填充的机械臂数据）
-        robot_indices = (state_magnitudes > threshold).nonzero(as_tuple=True)[0]
-        
-        return robot_indices
-    
     def shared_inference_step(self, batch: Dict) -> Tuple[Tensor, Dict]:
         """共享的推理步骤（验证/测试分支）。"""
         return self._compute_step(batch=batch, vq_training=False)
@@ -264,15 +275,43 @@ class VJEPA_LAM(LightningModule):
             (loss, logs)
         """
         videos = batch["videos"]
-        states = batch["proprio"]
+        states = batch.get("states", batch.get("proprio", None))
+        if states is None:
+            raise KeyError("LAM training/inference requires `states` (or legacy `proprio`) in batch.")
+        state_mask = batch.get("state_mask", None)
         dec_videos = batch["dec_videos"]
-        dataset_ids = batch.get("dataset_ids", None)
+        if vq_training:
+            if "embodiment_ids" not in batch:
+                raise KeyError("LAM training requires `embodiment_ids` in batch.")
+            embodiment_ids = batch["embodiment_ids"]
+            if not isinstance(embodiment_ids, torch.Tensor):
+                raise TypeError(
+                    f"LAM training expects `embodiment_ids` as torch.Tensor, got {type(embodiment_ids).__name__}."
+                )
+        else:
+            embodiment_ids = batch.get("embodiment_ids", None)
+            if embodiment_ids is not None and not isinstance(embodiment_ids, torch.Tensor):
+                raise TypeError(
+                    f"LAM inference expects `embodiment_ids` as torch.Tensor when provided, got {type(embodiment_ids).__name__}."
+                )
         # print("videos shape:", videos.shape)
         # VQ 路径区分在模型内部（视觉编码也已迁移到 LAM 内部）
         if vq_training:
-            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam(videos, states, dec_videos, dataset_ids=dataset_ids)
+            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam(
+                videos,
+                states,
+                dec_videos,
+                state_mask=state_mask,
+                embodiment_ids=embodiment_ids,
+            )
         else:
-            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam.inference(videos, states, dec_videos, dataset_ids=dataset_ids)
+            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam.inference(
+                videos,
+                states,
+                dec_videos,
+                state_mask=state_mask,
+                embodiment_ids=embodiment_ids,
+            )
 
         # 简易烟囱测试：确保解码输出存在且形状匹配目标
         if recon is None:
@@ -314,18 +353,46 @@ class VJEPA_LAM(LightningModule):
         aux_loss = torch.tensor(0.0, device=self.device)
         aux_loss_logs: Dict[str, Tensor] = {}
 
-        if "proprio" in batch and delta_s_pred is not None:
-            states = batch["proprio"]
+        if delta_s_pred is not None:
+            if vq_training and "delta_proprio" not in batch:
+                raise KeyError("LAM training requires `delta_proprio` in batch for state auxiliary loss.")
+            if vq_training and state_mask is None:
+                raise KeyError("LAM training requires `state_mask` in batch for state auxiliary loss.")
+
             state_deltas = batch.get("delta_proprio", None)
-            robot_indices = self._detect_robot_data(states)
-            if len(robot_indices) > 0:
-                delta_s_pred_robot = delta_s_pred[robot_indices]
-                delta_robot = state_deltas[robot_indices] if state_deltas is not None else None
-                state_loss = eef_reconstruction_loss(delta_s_pred_robot, state_delta=delta_robot)
+            if state_deltas is not None and not isinstance(state_deltas, torch.Tensor):
+                state_deltas = torch.as_tensor(state_deltas, device=delta_s_pred.device, dtype=delta_s_pred.dtype)
+            if state_mask is not None and not isinstance(state_mask, torch.Tensor):
+                state_mask = torch.as_tensor(state_mask, device=delta_s_pred.device)
+
+            if embodiment_ids is None:
+                robot_mask = torch.zeros(delta_s_pred.shape[0], dtype=torch.bool, device=delta_s_pred.device)
+            else:
+                robot_mask = embodiment_ids.view(-1).to(device=delta_s_pred.device, dtype=torch.long) != 0
+            if robot_mask.any():
+                if state_deltas is None:
+                    raise KeyError("State auxiliary loss requires `delta_proprio`.")
+                if state_mask is None:
+                    raise KeyError("State auxiliary loss requires `state_mask`.")
+
+                delta_s_pred_robot = delta_s_pred[robot_mask]
+                delta_robot = state_deltas[robot_mask]
+                state_mask_robot = state_mask[robot_mask]
+
+                if state_mask_robot.ndim == 3 and state_mask_robot.shape[1] == 2:
+                    state_mask_robot = state_mask_robot.any(dim=1)
+
+                state_loss = eef_reconstruction_loss(
+                    delta_s_pred_robot,
+                    state_delta=delta_robot,
+                    state_mask=state_mask_robot,
+                    state_loss_type=self.state_loss_type,
+                )
                 aux_loss = self.lambda_aux * state_loss
                 aux_loss_logs["state_loss"] = aux_loss.item()
-                # aux_loss_logs["robot_data_count"] = torch.tensor(len(robot_indices), device=self.device)
                 total_loss = total_loss + aux_loss
+            else:
+                aux_loss_logs["state_loss_skipped"] = 1.0
 
             logs: Dict[str, Tensor] = {
                 "recon_loss": recon_loss,
@@ -381,7 +448,7 @@ class VJEPA_LAM(LightningModule):
             logger=False,
             on_step=True,
             on_epoch=False,
-            sync_dist=True
+            sync_dist=False
         )
         if self.distributed_state.is_main_process:
             # 将 tensors 转换为 Python 标量用于 wandb
@@ -420,6 +487,8 @@ class VJEPA_LAM(LightningModule):
         return loss
     
     def on_after_backward(self) -> None:
+        if self._unused_params_scanned:
+            return
         if not getattr(self.trainer, "is_global_zero", True):
             return
         unused = []
@@ -428,6 +497,7 @@ class VJEPA_LAM(LightningModule):
                 unused.append(name)
         if unused:
             self.print(f"UNUSED params ({len(unused)}): " + ", ".join(unused))
+        self._unused_params_scanned = True
     
     # def on_train_epoch_end(self):
     #     """训练 epoch 结束时的回调"""
@@ -585,31 +655,35 @@ class CodebookMaintenanceCallback(pl.Callback):
 
 
 class SaveConfigToCheckpointCallback(pl.Callback):
-    def __init__(self, config_path: str = "", filename: str = "lam-vjepa.yaml"):
+    def __init__(self, config_path: str = "", filename: str = ""):
         super().__init__()
-        # 若未显式传入：优先使用环境变量 LAM_CONFIG_PATH，其次回落到默认包内配置
-        origin = "default"
-        if not config_path:
-            env_config_path = os.environ.get("LAM_CONFIG_PATH", "")
-            if env_config_path:
-                self.config_path = env_config_path
-                origin = "env"
-            else:
-                from pathlib import Path
-                base_dir = Path(__file__).resolve().parents[1]
-                self.config_path = str(base_dir / "config" / "lam-vjepa.yaml")
-                origin = "default"
-        else:
-            self.config_path = config_path
-            origin = "arg"
+        self.config_path = config_path or os.environ.get("LAM_CONFIG_PATH", "")
+        self.filename = filename or ""
 
-        # 目标文件名：若来源为 env/arg 且未显式自定义文件名，则使用源配置名
-        self.filename = filename
-        if (not self.filename or self.filename == "lam-vjepa.yaml") and origin in ("env", "arg"):
-            try:
-                self.filename = os.path.basename(self.config_path)
-            except Exception:
-                self.filename = filename or "lam-vjepa.yaml"
+    def _resolve_source_config_path(self) -> Optional[str]:
+        # 优先：显式传入/环境变量指定的配置路径
+        if self.config_path and os.path.isfile(self.config_path):
+            return self.config_path
+        env_config_path = os.environ.get("LAM_CONFIG_PATH", "")
+        if env_config_path and os.path.isfile(env_config_path):
+            return env_config_path
+
+        # 回退：从仓库内 config 目录中选择可用 yaml
+        base_dir = Path(__file__).resolve().parents[1]
+        config_dir = base_dir / "config"
+        for candidate in ("dino_base_ae.yaml", "lam-vjepa.yaml"):
+            path = config_dir / candidate
+            if path.is_file():
+                return str(path)
+        for path in sorted(config_dir.glob("*.yaml")):
+            if path.is_file():
+                return str(path)
+        return None
+
+    def _resolve_filename(self, src_config_path: str) -> str:
+        if self.filename:
+            return self.filename
+        return os.path.basename(src_config_path)
 
     def _resolve_log_dir(self, trainer) -> Optional[str]:
         logger_obj = trainer.logger
@@ -626,17 +700,21 @@ class SaveConfigToCheckpointCallback(pl.Callback):
         return None
 
     def on_fit_start(self, trainer, pl_module):
-        # 基于 logger 管理的目录保存，不依赖 ModelCheckpoint.dirpath
+        src_config_path = self._resolve_source_config_path()
+        if not src_config_path:
+            pl_module.print("未找到可用配置文件，跳过保存配置文件")
+            return
+
         log_dir = self._resolve_log_dir(trainer)
         if not log_dir:
             pl_module.print("无法解析 logger 保存目录，跳过保存配置文件")
             return
 
-        ckpt_dir = log_dir
+        filename = self._resolve_filename(src_config_path)
         try:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            dst_path = os.path.join(ckpt_dir, self.filename)
-            shutil.copyfile(self.config_path, dst_path)
+            os.makedirs(log_dir, exist_ok=True)
+            dst_path = os.path.join(log_dir, filename)
+            shutil.copyfile(src_config_path, dst_path)
             pl_module.print(f"Saved config to {dst_path}")
         except Exception as e:
             pl_module.print(f"Failed to save config: {e}")

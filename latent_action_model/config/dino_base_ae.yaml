@@ -12,27 +12,31 @@ seed_everything: 42
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
-  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
-  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
+  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
-  dim: 768                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
-  enc_layers: 12               # LAM 编码器层数 16head
-  ffn_expansion_factor: 3
-  num_heads: 12
-  max_state_dim: 32            # 与 data.max_proprio_dim 对齐（多数据集 state padding）
+  dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
+  enc_layers: 24               # LAM 编码器层数 16head
+  ffn_expansion_factor: 4
+  num_heads: 16
+  max_state_dim: 32            # 与 data.max_state_dim 对齐（多数据集 state padding）
+  num_embodiments: 32
   codebook_size: 32        # 码本大小
   code_dim: 64                # 码本维度
-  ar_prediction: false
   num_queries: 1
   num_frames: 2
-  dec_layers: 12                # 解码器层数
+  image_hw: [256, 256]
+  patch_size: 16
+  image_aug: false
+  dec_layers: 24                # 解码器层数
   dropout: 0.0                 # Dropout 率              
   warmup_steps: 0           # 预热步数；0 表示关闭预热
   enc_add_state: false
   enc_modal_mask: true
   lambda_aux: 1.0                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
   loss_type: "l2"
+  state_loss_type: "l2"
 
   latent_layer_to_use: -2
   multi_input: false
@@ -64,17 +68,19 @@ model:
 data:
   # LeRobotDataModule (latent_action_model/data_loader/lerobot_datamodule.py)
   data_root_dir: "/mnt/project_rlinf/jlchen/datasets"
-  data_mix: "lam_plus_human"
-  video_backend: "torchvision_av"  # torchcodec is very slow on AgiBot AV1 random-access training
+  data_mix: "lam_plus_human"  # lam_plus_human
+  video_backend: "pyav"  # torchcodec is very slow on AgiBot AV1 random-access training
   num_frames: 2
   frame_dt_sec: 1.6
-  batch_size: 128
-  num_workers: 8
-  prefetch_factor: 8
-  in_order: false  # 关闭严格顺序出队，减少每 num_workers step 的周期性卡顿
-  # prefetch_factor: 8   # 若 CPU 打满可减小 num_workers(如 4~8) 或增大 prefetch_factor(如 8)，显存有余可增大 batch_size
+  batch_size: 64
+  # 多卡默认使用更保守的数据加载并发，避免视频解码触发主机内存峰值
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: false
+  persistent_workers: false
+  in_order: false  # 快 worker 先出队，减少周期性卡顿
   debug_repeat_batch: false
-  max_proprio_dim: 32
+  max_state_dim: 32
 
 # 训练器参数
 trainer:
@@ -101,8 +107,8 @@ trainer:
         save_last: true
         save_top_k: -1
         # save_on_train_epoch_end: true    # 每个epoch结束时也保存
-        every_n_epochs: 2
-        # every_n_train_steps: 10000
+        every_n_epochs: 1
+        # every_n_train_steps: 100
         filename: "{epoch}"
         
 

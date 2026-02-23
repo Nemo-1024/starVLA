@@ -44,9 +44,9 @@ class Fixed3DPositionalEncoding(nn.Module):
             t_dim = h_dim = w_dim = int(math.ceil(embed_dim / 6) * 2)
 
         # 生成三个方向的编码
-        self.register_buffer("pe_t", self._build_1d_pos_embed(t_dim, T))  # [T, t_dim]
-        self.register_buffer("pe_h", self._build_1d_pos_embed(h_dim, H))  # [H, h_dim]
-        self.register_buffer("pe_w", self._build_1d_pos_embed(w_dim, W))  # [W, w_dim]
+        self.register_buffer("pe_t", self._build_1d_pos_embed(t_dim, T), persistent=False)  # [T, t_dim]
+        self.register_buffer("pe_h", self._build_1d_pos_embed(h_dim, H), persistent=False)  # [H, h_dim]
+        self.register_buffer("pe_w", self._build_1d_pos_embed(w_dim, W), persistent=False)  # [W, w_dim]
 
         # 拼接成最终 embedding
         pe_t_expand = self.pe_t[:, None, None, :]          # [T,1,1,t_dim]
@@ -59,7 +59,7 @@ class Fixed3DPositionalEncoding(nn.Module):
         pe_w_expand = nn.functional.pad(pe_w_expand, (0, embed_dim - w_dim))
 
         # 相加形成联合编码
-        self.register_buffer("pos_embed", pe_t_expand + pe_h_expand + pe_w_expand)  # [T,H,W,D]
+        self.register_buffer("pos_embed", pe_t_expand + pe_h_expand + pe_w_expand, persistent=False)  # [T,H,W,D]
 
     def _build_1d_pos_embed(self, dim: int, length: int):
         """生成 1D sin-cos 编码"""
@@ -104,8 +104,8 @@ class Fixed2DPositionalEncoding(nn.Module):
             h_dim = w_dim = int(math.ceil(embed_dim / 4) * 2)
 
         # 生成两个方向的编码
-        self.register_buffer("pe_h", self._build_1d_pos_embed(h_dim, H))  # [H, h_dim]
-        self.register_buffer("pe_w", self._build_1d_pos_embed(w_dim, W))  # [W, w_dim]
+        self.register_buffer("pe_h", self._build_1d_pos_embed(h_dim, H), persistent=False)  # [H, h_dim]
+        self.register_buffer("pe_w", self._build_1d_pos_embed(w_dim, W), persistent=False)  # [W, w_dim]
 
         # 拼接成最终 embedding
         pe_h_expand = self.pe_h[:, None, :]          # [H,1,h_dim]
@@ -116,7 +116,7 @@ class Fixed2DPositionalEncoding(nn.Module):
         pe_w_expand = nn.functional.pad(pe_w_expand, (0, embed_dim - w_dim))
 
         # 相加形成联合编码
-        self.register_buffer("pos_embed", pe_h_expand + pe_w_expand)  # [H,W,D]
+        self.register_buffer("pos_embed", pe_h_expand + pe_w_expand, persistent=False)  # [H,W,D]
 
     def _build_1d_pos_embed(self, dim: int, length: int):
         """生成 1D sin-cos 编码"""

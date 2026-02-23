@@ -33,8 +33,8 @@ class ConcatTransform(InvertibleModalityTransform):
         default_factory=list, description="Not used in this transform, kept for compatibility."
     )
 
-    video_concat_order: list[str] = Field(
-        ...,
+    video_concat_order: Optional[list[str]] = Field(
+        default=None,
         description="Concatenation order for each video modality. "
         "Format: ['video.ego_view_pad_res224_freq20', ...]",
     )
@@ -59,6 +59,11 @@ class ConcatTransform(InvertibleModalityTransform):
         default_factory=dict,
         description="The dimensions of the state keys.",
     )
+    max_stateaction_dim: int = Field(
+        default=14,
+        description="The maximum dimension for concatenated state/action tensors. "
+        "If exceeded, an error is raised. If smaller, values are right-padded with zeros.",
+    )
 
     def model_dump(self, *args, **kwargs):
         if kwargs.get("mode", "python") == "json":
@@ -67,11 +72,52 @@ class ConcatTransform(InvertibleModalityTransform):
                 "video_concat_order",
                 "state_concat_order",
                 "action_concat_order",
+                "max_stateaction_dim",
             }
         else:
             include = kwargs.pop("include", None)
 
         return super().model_dump(*args, include=include, **kwargs)
+
+    def _concat_and_pad_with_mask(
+        self,
+        data: dict,
+        concat_order: list[str],
+        modality_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensors = []
+        for key in concat_order:
+            value = data.pop(key)
+            assert isinstance(
+                value, torch.Tensor
+            ), f"{modality_name} value for {key} must be torch.Tensor, got {type(value)}"
+            tensors.append(value)
+
+        merged = torch.cat(tensors, dim=-1)
+        current_dim = merged.shape[-1]
+        if current_dim > self.max_stateaction_dim:
+            raise ValueError(
+                f"Concatenated {modality_name} dim exceeds max_stateaction_dim: "
+                f"{current_dim} > {self.max_stateaction_dim}. {modality_name}_concat_order={concat_order}"
+            )
+
+        if current_dim < self.max_stateaction_dim:
+            pad_shape = list(merged.shape)
+            pad_shape[-1] = self.max_stateaction_dim - current_dim
+            pad = torch.zeros(
+                pad_shape,
+                dtype=merged.dtype,
+                device=merged.device,
+            )
+            merged = torch.cat([merged, pad], dim=-1)
+
+        mask = torch.zeros(
+            merged.shape,
+            dtype=torch.bool,
+            device=merged.device,
+        )
+        mask[..., :current_dim] = True
+        return merged, mask
 
     def apply(self, data: dict) -> dict:
         grouped_keys = {}
@@ -88,11 +134,10 @@ class ConcatTransform(InvertibleModalityTransform):
                 grouped_keys[modality] = []
             grouped_keys[modality].append(key)
 
-        if "video" in grouped_keys:
+        if "video" in grouped_keys and self.video_concat_order is not None:
             # Check if keys in video_concat_order, state_concat_order, action_concat_order are
             # ineed contained in the data. If not, then the keys are misspecified
             video_keys = grouped_keys["video"]
-            assert self.video_concat_order is not None, f"{self.video_concat_order=}, {video_keys=}"
             assert all(
                 item in video_keys for item in self.video_concat_order
             ), f"keys in video_concat_order are misspecified, \n{video_keys=}, \n{self.video_concat_order=}"
@@ -130,9 +175,11 @@ class ConcatTransform(InvertibleModalityTransform):
                 ), f"State dim mismatch for {key=}, {data[key].shape[-1]=}, {target_shapes=}"
             # Concatenate the state keys
             # We'll have StateActionToTensor before this transform, so here we use torch.cat
-            data["state"] = torch.cat(
-                [data.pop(key) for key in self.state_concat_order], dim=-1
-            )  # [T, D_state]
+            data["state"], data["state_mask"] = self._concat_and_pad_with_mask(
+                data,
+                self.state_concat_order,
+                "state",
+            )
 
         if "action" in grouped_keys:
             action_keys = grouped_keys["action"]
@@ -147,17 +194,20 @@ class ConcatTransform(InvertibleModalityTransform):
                 if self.is_rotation_key(key):
                     target_shapes.append(3)  # Allow for axis angle
                 assert (
-                    self.action_dims[key] == data[key].shape[-1]
-                ), f"Action dim mismatch for {key=}, {self.action_dims[key]=}, {data[key].shape[-1]=}"
+                    data[key].shape[-1] in target_shapes
+                ), f"Action dim mismatch for {key=}, {data[key].shape[-1]=}, {target_shapes=}"
             # Concatenate the action keys
-            # We'll have StateActionToTensor before this transform, so here we use torch.cat
-            data["action"] = torch.cat(
-                [data.pop(key) for key in self.action_concat_order], dim=-1
-            )  # [T, D_action]
+            data["action"], data["action_mask"] = self._concat_and_pad_with_mask(
+                data,
+                self.action_concat_order,
+                "action",
+            )
 
         return data
 
     def unapply(self, data: dict) -> dict:
+        data.pop("action_mask", None)
+        data.pop("state_mask", None)
         start_dim = 0
         assert "action" in data, f"{data.keys()=}"
         # For those dataset without actions (LAPA), we'll never run unapply

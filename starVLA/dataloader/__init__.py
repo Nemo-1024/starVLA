@@ -1,11 +1,12 @@
 import json
 import os
-from accelerate.logging import get_logger
-import numpy as np
-from torch.utils.data import DataLoader
+from pathlib import Path
+
 import numpy as np
 import torch.distributed as dist
-from pathlib import Path
+from accelerate.logging import get_logger
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader
 
 logger = get_logger(__name__)
 
@@ -33,6 +34,15 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
+    # Hard fail if legacy VLM CoTrain config is present (VLM CoTrain has been removed).
+    if OmegaConf.is_config(cfg) and hasattr(cfg, "datasets") and hasattr(cfg.datasets, "vlm_data"):
+        raise ValueError(
+            "VLM CoTrain has been removed. Remove 'datasets.vlm_data' from your config and use VLA-only training."
+        )
+    if dataset_py == "vlm_datasets":
+        raise ValueError(
+            "VLM CoTrain has been removed. Use dataset_py='lerobot_datasets' (or other VLA dataset) instead of 'vlm_datasets'."
+        )
 
     if dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
@@ -47,15 +57,8 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             num_workers=4,
             # shuffle=True
         )        
-        if dist.get_rank() == 0: 
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
             
             output_dir = Path(cfg.output_dir)
             vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
         return vla_train_dataloader
-    elif dataset_py == "vlm_datasets":
-        from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
-
-        vlm_data_module = make_vlm_dataloader(cfg)
-        vlm_train_dataloader = vlm_data_module["train_dataloader"]
-        
-        return vlm_train_dataloader

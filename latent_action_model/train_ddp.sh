@@ -1,27 +1,41 @@
 REPO_ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 export PYTHONPATH="${PYTHONPATH}:${REPO_ROOT_DIR}"
+cd "${REPO_ROOT_DIR}" || exit 1
+
+# Hugging Face 缓存目录（数据集、模型等），放在 REPO_ROOT_DIR 的祖父目录下
+HF_CACHE_BASE="$(dirname "$(dirname "${REPO_ROOT_DIR}")")/.hf_cache"
+export HF_HOME="${HF_CACHE_BASE}"
+export HF_DATASETS_CACHE="${HF_CACHE_BASE}/datasets"
+export HUGGINGFACE_HUB_CACHE="${HF_CACHE_BASE}/hub"
+
 # NOTE:
-# 多节点/多卡下 torchrun 会启动多个训练进程；每个进程还会再启动 DataLoader workers。
-# 若 OMP/BLAS 线程数过大，CPU 过度订阅会导致吞吐抖动（表现为进度条跳步/间歇性卡顿）。
-# 因此默认将各类线程限制为 1；如需手动调优，可在外部先 export 覆盖。
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
-export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
-export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
-export PYTHONUNBUFFERED=1
+# 主进程（各 GPU 训练进程）限制为单线程，把 CPU 留给 DataLoader workers，避免过度订阅导致卡顿。
+# DataLoader worker 内线程数由 lerobot_datamodule 的 worker_init_fn 控制（默认 1；可设 LAM_WORKER_OMP_THREADS=2 进一步压榨）。
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export BLIS_NUM_THREADS=1
+export TORCH_NUM_THREADS=1
+export TORCH_INTRAOP_THREADS=1
+export TORCH_INTEROP_THREADS=1
+# OpenMP: 不等待，尽快让出 CPU 给其他线程/进程（利于多 worker 数据加载）
+export KMP_BLOCKTIME=0
+# 可选：为 worker 内解码留更多线程（默认不设=1）；若 CPU 仍有大量 idle 可试 export LAM_WORKER_OMP_THREADS=2
+# export LAM_WORKER_OMP_THREADS=2
 export TF_CPP_MIN_LOG_LEVEL=3
 export WANDB_DISABLE_STATS=true
 export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_TIMEOUT=1800   # 单位：秒
+export TORCH_NCCL_TIMEOUT=7200  # 单位：秒
 
 # 训练参数
 # CONFIG_FILE="config/lam-vjepa_large.yaml"
 # 默认配置文件（当未在命令行通过 --config 指定时使用）
-DEFAULT_CONFIG_FILE="${REPO_ROOT_DIR}/latent_action_model/config/lam-vjepa.yaml"
+DEFAULT_CONFIG_FILE="${REPO_ROOT_DIR}/latent_action_model/config/dino_base_ae.yaml"
 TIMESTAMP="$(date +%m%d_%H%M%S)"
-LOG_DIR="latent_action_model/logs/train_logs/${TIMESTAMP}"
+LOG_DIR="${REPO_ROOT_DIR}/latent_action_model/logs/train_logs/${TIMESTAMP}"
 
 LOG_FILE="${LOG_DIR}/train_logs.log"
 
@@ -91,26 +105,27 @@ else
     export LAM_TRAIN_LOG_FILE="${REPO_ROOT_DIR}/${LOG_FILE}"
 fi
 
-# 仅在用户通过 --config 指定配置时，备份该用户配置到日志目录
-if [[ "${HAS_USER_CONFIG}" == true ]]; then
-    if [[ -n "${USER_CONFIG_FILE}" && -f "${USER_CONFIG_FILE}" ]]; then
-        cp "${USER_CONFIG_FILE}" "${LOG_DIR}/$(basename "${USER_CONFIG_FILE}")"
+# 解析本次训练实际使用的配置文件路径（无论默认还是用户 --config）
+SOURCE_CONFIG_FILE="${DEFAULT_CONFIG_FILE}"
+if [[ "${HAS_USER_CONFIG}" == true && -n "${USER_CONFIG_FILE}" ]]; then
+    SOURCE_CONFIG_FILE="${USER_CONFIG_FILE}"
+fi
+
+if [[ "${SOURCE_CONFIG_FILE}" = /* ]]; then
+    export LAM_CONFIG_PATH="${SOURCE_CONFIG_FILE}"
+else
+    if command -v realpath &> /dev/null; then
+        export LAM_CONFIG_PATH="$(realpath -m "${SOURCE_CONFIG_FILE}")"
     else
-        echo "⚠️ 用户配置文件未找到或未提供: ${USER_CONFIG_FILE}" >&2
+        export LAM_CONFIG_PATH="${REPO_ROOT_DIR}/${SOURCE_CONFIG_FILE}"
     fi
 fi
 
-# 若指定了用户配置，将其绝对路径导出为环境变量，供回调保存使用
-if [[ "${HAS_USER_CONFIG}" == true && -n "${USER_CONFIG_FILE}" ]]; then
-    if [[ "${USER_CONFIG_FILE}" = /* ]]; then
-        export LAM_CONFIG_PATH="${USER_CONFIG_FILE}"
-    else
-        if command -v realpath &> /dev/null; then
-            export LAM_CONFIG_PATH="$(realpath -m "${USER_CONFIG_FILE}")"
-        else
-            export LAM_CONFIG_PATH="${REPO_ROOT_DIR}/${USER_CONFIG_FILE}"
-        fi
-    fi
+# 备份实际配置到外部训练日志目录，便于从 train_logs 目录直接回溯参数
+if [[ -f "${LAM_CONFIG_PATH}" ]]; then
+    cp "${LAM_CONFIG_PATH}" "${LOG_DIR}/$(basename "${LAM_CONFIG_PATH}")"
+else
+    echo "⚠️ 配置文件未找到: ${LAM_CONFIG_PATH}" >&2
 fi
 
 # 自动获取 GPU 数量
@@ -122,29 +137,32 @@ else
 fi
 echo "🖥️ 检测到 GPU 数量: ${NUM_GPUS}"
 
-# 2. 与平台语义对齐的多节点参数获取：
-# 平台：WORLD_SIZE=节点数（pods），RANK=节点编号
-# torchrun：需要 nnodes、node_rank，并可选导出 WORLD_SIZE=总进程数
-NNODES=${WORLD_SIZE:-1}
-NODE_RANK=${RANK:-0}
+# 分布式参数：
+# - 优先读取显式传入的 NNODES/NODE_RANK
+# - 兼容平台常见约定：WORLD_SIZE=节点数，RANK=节点编号
+NNODES="${NNODES:-${WORLD_SIZE:-1}}"
+NODE_RANK="${NODE_RANK:-${RANK:-0}}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
 
-# 计算 PyTorch 期望的总进程数，并导出（部分环境会读取该变量）
-if [[ -n "${NNODES}" && -n "${NUM_GPUS}" && "${NUM_GPUS}" -gt 0 ]]; then
-    export WORLD_SIZE=$(( NNODES * NUM_GPUS ))
+# 导出总进程数（仅在参数可解析时），供部分依赖 WORLD_SIZE 的组件读取
+if [[ "${NNODES}" =~ ^[0-9]+$ && "${NUM_GPUS}" =~ ^[0-9]+$ && "${NUM_GPUS}" -gt 0 ]]; then
+    export WORLD_SIZE="$(( NNODES * NUM_GPUS ))"
 fi
-
-MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-MASTER_PORT=${MASTER_PORT:-29500}
 
 echo "🌐 分布式训练配置:"
 echo "➡️  节点数量 (nnodes): ${NNODES}"
 echo "🆔 当前节点排名 (node_rank): ${NODE_RANK}"
 echo "🔗 主节点地址 (master_addr): ${MASTER_ADDR}"
 echo "🔌 主节点端口 (master_port): ${MASTER_PORT}"
+if [[ -n "${WORLD_SIZE}" ]]; then
+    echo "🌍 全局进程数 (world_size): ${WORLD_SIZE}"
+fi
 
 # --- 启动训练 ---
 # torchrun 负责启动进程和设置通信
 # LightningCLI (--trainer.*) 负责配置 Trainer 对象
+# 使用 unbuffered 输出确保日志实时写入
 torchrun --nproc_per_node ${NUM_GPUS} \
          --nnodes ${NNODES} \
          --node_rank ${NODE_RANK} \
@@ -155,4 +173,12 @@ torchrun --nproc_per_node ${NUM_GPUS} \
          --trainer.num_nodes ${NNODES} \
          ${CKPT_PATH:+--ckpt_path ${CKPT_PATH}} \
          "$@" \
-         2>&1 | tee ${LOG_FILE}
+         2>&1 | tee -a "${LOG_FILE}"
+
+# 训练结束后确保日志文件存在
+if [ -f "${LOG_FILE}" ]; then
+    echo "✅ 训练日志已保存到: ${LOG_FILE}"
+    echo "📊 日志文件大小: $(du -h "${LOG_FILE}" | cut -f1)"
+else
+    echo "⚠️ 警告: 日志文件未找到: ${LOG_FILE}"
+fi

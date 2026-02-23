@@ -25,10 +25,10 @@ mkdir -p ${output_dir}
 cp $0 ${output_dir}/
 
 accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --config_file starVLA/config/accelerate/ddp_bf16.yaml \
   --num_processes 8 \
   starVLA/training/train_starvla.py \
-  --config_yaml ./examples/Robocasa_tabletop/train_files/starvla_cotrain_robocasa_gr1.yaml \
+  --config_yaml ./examples/Robocasa_tabletop/train_files/starvla_train_robocasa_gr1.yaml \
   --framework.name ${Framework_name} \
   --framework.qwenvl.base_vlm ${base_vlm} \
   --framework.action_model.action_model_type ${DIT_TYPE} \

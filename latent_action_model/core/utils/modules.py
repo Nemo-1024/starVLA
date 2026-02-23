@@ -7,54 +7,77 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import drop_path
+from typing import Tuple
 
 
-def build_action_block_causal_attention_mask(T, H, W, add_tokens=1):
-    N_T = add_tokens + (H * W)
-    N = T * N_T
-    mask = torch.zeros(N, N).bool()
-    mask_block = torch.ones(N_T, N_T).bool()
-    local_window_time = T
+class CategorySpecificLinear(nn.Module):
+    def __init__(self, num_categories: int, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.num_categories = int(num_categories)
+        self.W = nn.Parameter(0.02 * torch.randn(self.num_categories, input_dim, hidden_dim))
+        self.b = nn.Parameter(torch.zeros(self.num_categories, hidden_dim))
 
-    for t1 in range(T):
-        for t2 in range(max(0, t1 - local_window_time + 1), t1 + 1):
-            mask[t1 * N_T : (t1 + 1) * N_T, t2 * N_T : (t2 + 1) * N_T] = mask_block
+    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
+        if not isinstance(cat_ids, torch.Tensor):
+            raise TypeError(
+                f"CategorySpecificLinear expects `cat_ids` as torch.Tensor, got {type(cat_ids).__name__}."
+            )
+        if x.dim() != 3:
+            raise ValueError(f"CategorySpecificLinear expects `x` with shape [B,T,D], got {tuple(x.shape)}")
+        if cat_ids.ndim == 2 and cat_ids.size(1) == 1:
+            cat_ids = cat_ids.squeeze(1)
+        elif cat_ids.ndim != 1:
+            raise ValueError(
+                f"CategorySpecificLinear expects `cat_ids` with shape [B] or [B,1], got {tuple(cat_ids.shape)}"
+            )
+        if cat_ids.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"CategorySpecificLinear batch mismatch: x B={x.shape[0]} vs cat_ids B={cat_ids.shape[0]}"
+            )
+        cat_ids = cat_ids.to(device=x.device, dtype=torch.long)
+        selected_W = self.W[cat_ids]
+        selected_b = self.b[cat_ids]
+        return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)
 
-    return mask
+
+class CategorySpecificMLP(nn.Module):
+    def __init__(self, num_categories: int, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.layer1 = CategorySpecificLinear(num_categories, input_dim, hidden_dim)
+        self.layer2 = CategorySpecificLinear(num_categories, hidden_dim, output_dim)
+
+    def forward(self, x: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
+        if not isinstance(cat_ids, torch.Tensor):
+            raise TypeError(
+                f"CategorySpecificMLP expects `cat_ids` as torch.Tensor, got {type(cat_ids).__name__}."
+            )
+        squeeze_time = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze_time = True
+        elif x.dim() != 3:
+            raise ValueError(f"CategorySpecificMLP expects `x` with shape [B,D] or [B,T,D], got {tuple(x.shape)}")
+        hidden = F.relu(self.layer1(x, cat_ids))
+        out = self.layer2(hidden, cat_ids)
+        if squeeze_time:
+            out = out.squeeze(1)
+        return out
 
 
-def build_modal_block_attention_mask(T, H, W, add_tokens=1, ar_query: bool = True, num_queries: int = 1):
+def build_modal_block_attention_mask(T, H, W, add_tokens=1, num_queries: int = 1):
     """
-    基于“后置”约定构造模态掩码（统一将附加 token 放在末尾）：
-    - 约定每帧 token 排布为：
-      ar_query=True:  [H*W 图像 patch, add_tokens..., query(num_queries)]
-      ar_query=False: [H*W 图像 patch, add_tokens...]，并在序列尾部追加 num_queries 个全局 query
-    - 规则：
-      1) image_feature 只能看到 image_feature
-      2) state 只能看到 state
-      3) query 能看到所有模态（包括 query/state/image）
-    - 返回：allowed 掩码（True 表示允许注意），形状 [N, N]
-      其中：
-        ar_query=True  -> N = T * (H*W + add_tokens + num_queries)
-        ar_query=False -> N = T * (H*W + add_tokens) + num_queries
+    基于“后置”约定构造模态掩码：每帧 [image..., add_tokens...]，序列尾部追加 num_queries 个全局 query。
+    规则：image 仅见 image，state 仅见 state，query 可见所有模态。
+    返回：allowed 掩码（True=允许注意），形状 [N, N]，N = T * (H*W + add_tokens) + num_queries。
     """
     assert add_tokens >= 0, "add_tokens 表示每帧额外的非 query 帧级 token 数（如 state），可为 0 或更大"
-    if ar_query:
-        # 每帧排列：[image..., add_tokens..., query]
-        N_T = (H * W) + add_tokens + num_queries
-        frame_modality_ids = torch.full((N_T,), 1, dtype=torch.long)  # 默认 image=1
-        if add_tokens > 0:
-            frame_modality_ids[H * W : H * W + add_tokens] = 0  # state-like
-        frame_modality_ids[-num_queries:] = 2  # query
-        modality_ids = frame_modality_ids.repeat(T)  # [T*N_T]
-    else:
-        # 帧内排列：[image..., add_tokens...]，全局在序列尾部追加 1 个 query
-        N_T = (H * W) + add_tokens
-        frame_modality_ids = torch.full((N_T,), 1, dtype=torch.long)  # 默认 image=1
-        if add_tokens > 0:
-            frame_modality_ids[H * W :] = 0  # state-like
-        modality_ids = frame_modality_ids.repeat(T)  # [T*N_T]
-        modality_ids = torch.cat([modality_ids, torch.tensor([2] * num_queries, dtype=torch.long)], dim=0)  # 追加全局 query
+    N_T = (H * W) + add_tokens
+    frame_modality_ids = torch.full((N_T,), 1, dtype=torch.long)  # 默认 image=1
+    if add_tokens > 0:
+        frame_modality_ids[H * W :] = 0  # state-like
+    modality_ids = frame_modality_ids.repeat(T)  # [T*N_T]
+    query_modality_ids = modality_ids.new_full((num_queries,), 2)  # 与 modality_ids 保持同 dtype/device
+    modality_ids = torch.cat([modality_ids, query_modality_ids], dim=0)  # 追加全局 query
     N = modality_ids.numel()
     row = modality_ids.unsqueeze(1)  # [N,1]
     col = modality_ids.unsqueeze(0)  # [1,N]
@@ -63,40 +86,6 @@ def build_modal_block_attention_mask(T, H, W, add_tokens=1, ar_query: bool = Tru
     row_is_query = (row == 2).expand(-1, N)
     allowed = same_modality | row_is_query
     return allowed
-
-
-def build_decoder_block_attention_mask(T, H, W, add_tokens=2, query_index=0, is_causal=True):
-    """
-    LAMDecoder 用的“前置”掩码（ACRoPEAttention 要求 add_tokens 前置）：
-    - 每帧排列：[add_tokens..., H*W image]
-      其中 add_tokens 中包含 1 个 query（用 action 表示），其余为其它帧级 token（如 state）
-    - 规则：
-      1) image 仅能看 image
-      2) state-like(其它 add_tokens) 仅能看 state-like
-      3) 所有 row 皆可看 query（latent）
-      4) latent(query) 仅能看 query
-    - 若 is_causal=True，则再与帧级 block 因果掩码做“与”合并（保留过去与当前帧）
-    - 返回：allowed 掩码（True=允许注意），形状 [N, N]，N = T * (add_tokens + H*W)
-    """
-    assert 0 <= query_index < add_tokens, "query_index 需在 [0, add_tokens) 范围内"
-    N_T = add_tokens + (H * W)
-    # 类型编码：0=state-like, 1=image, 2=query
-    frame_types = torch.full((N_T,), 1, dtype=torch.long)  # image=1
-    if add_tokens > 0:
-        frame_types[:add_tokens] = 0  # state-like
-    frame_types[query_index] = 2  # query(action)
-    types = frame_types.repeat(T)  # [N]
-    row = types.unsqueeze(1)  # [N,1]
-    col = types.unsqueeze(0)  # [1,N]
-    # modal 可见性：同模态可见 + query 全可见；其中 query 行仅能看 query
-    same_type = row == col
-    col_is_query = col == 2
-    allowed_modal = same_type | col_is_query
-    if is_causal:
-        allowed_time = build_action_block_causal_attention_mask(T, H, W, add_tokens=add_tokens)
-        return allowed_modal & allowed_time
-    else:
-        return allowed_modal
 
 
 def rotate_queries_or_keys(x, pos, omega: torch.Tensor = None):
@@ -749,93 +738,42 @@ class QFormer_att(nn.Module):
     Q-Former 模型。
     通过堆叠多个 QFormerBlock，使用一组可学习的查询向量从给定的上下文中提取特征。
     """
-    def __init__(self, query_dim, context_dim, num_frames, num_queries, grid_size, add_tokens=1, num_layers=6, num_heads=16, ffn_expansion_factor=2, dropout=0.1, ar_query: bool = False, use_mask: bool = False):
-        """
-        初始化 QFormer 模型。
-        
-        参数:
-            num_queries (int): 可学习的查询向量数量 (n)。
-            query_dim (int): 查询向量和最终输出的维度 (d)。
-            context_dim (int): 输入上下文特征的维度 (D)。
-            num_layers (int): QFormerBlock 的堆叠层数。
-            num_heads (int): 每个注意力模块的头数。
-            ffn_expansion_factor (int): FFN 的扩展因子。
-            dropout (float): Dropout 比率。
-        """
+    def __init__(self, query_dim, context_dim, num_frames, num_queries, grid_hw: Tuple[int, int], add_tokens=1, num_layers=6, num_heads=16, ffn_expansion_factor=2, dropout=0.1, use_mask: bool = False):
         super().__init__()
 
-        self.ar_query = ar_query
         self.query_dim = query_dim
-        if self.ar_query:
-            # 将查询向量直接以最终形状注册为 Parameter，确保随模块一起迁移设备
-            self.queries = nn.Parameter(torch.randn(1, num_frames, 1, context_dim))  # [1, T, 1, context_dim]
-        else:
-            self.queries = nn.Parameter(torch.randn(1, num_queries, context_dim))  #[1, 1, context_dim]
+        self.grid_height = int(grid_hw[0])
+        self.grid_width = int(grid_hw[1])
+        self.queries = nn.Parameter(torch.randn(1, num_queries, context_dim))  # [1, n, context_dim]
         self.q_cross_attn = CrossAttentionBlock(context_dim, num_heads)
         self.num_queries = num_queries
 
-        # 堆叠多个 QFormerBlock
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(d_model=context_dim, nhead=num_heads, dim_feedforward=int(context_dim*ffn_expansion_factor), dropout=dropout, batch_first=True, norm_first=True) for _ in range(num_layers)
         ])
 
-        # 预构建“模态自注意 + query全可见”的掩码，并与（若有）因果掩码合并
-        # 形状对齐规则：
-        #  - 输入 context 为 [B, T, (hw+1), D]
-        #  - 采用“后置”约定：
-        #       ar_query=True  -> 每帧重排为 [image(hw), state(1), query(1)]，全序列长度 L = T*(hw+2)
-        #       ar_query=False -> 每帧重排为 [image(hw), state(1)]，并在序列末尾追加 1 个全局 query，长度 L = T*(hw+1)+1
         if use_mask:
-            if self.ar_query:
-                # 使用“后置”约定：每帧 [image..., state, query]（add_tokens=1 表示 state）
-                modal_allowed = build_modal_block_attention_mask(num_frames, grid_size, grid_size, add_tokens=add_tokens, ar_query=True)
-                modal_mask = ~modal_allowed
-                # 合并因果掩码（帧级 block 因果），注意每帧额外 token 数为 2（state + query）
-                causal_disallow = ~build_action_block_causal_attention_mask(num_frames, grid_size, grid_size, add_tokens=add_tokens+1)
-                combined_mask = modal_mask | causal_disallow
-                self.register_buffer("src_mask", combined_mask, persistent=False)
-            else:
-                # 非自回归：帧内为 [image..., state]（add_tokens=1），序列末尾追加全局 query
-                modal_allowed = build_modal_block_attention_mask(num_frames, grid_size, grid_size, add_tokens=add_tokens, ar_query=False, num_queries=num_queries)
-                modality_mask = ~modal_allowed
-                self.register_buffer("src_mask", modality_mask, persistent=False)
+            modal_allowed = build_modal_block_attention_mask(
+                num_frames,
+                self.grid_height,
+                self.grid_width,
+                add_tokens=add_tokens,
+                num_queries=num_queries,
+            )
+            self.register_buffer("src_mask", ~modal_allowed, persistent=False)
         else:
             self.src_mask = None
+
     def forward(self, context):
-        """
-        前向传播。
-        
-        参数:
-            context (torch.Tensor): 来自时空主干的输出特征，
-                                    形状应为 [B, T, (hw+1), D]。
-        返回:
-            torch.Tensor: 经过 Q-Former 提取和处理后的特征，
-                          形状为 [B, n, d]，可以直接用于 VQ 量化。
-        """
-
         B, T, _, D = context.shape
-
-        # queries = self.proj_in(self.queries)
-
-        # 将 queries 扩展到 batch 维度，便于与 context 拼接
-        if self.ar_query:
-            queries = self.queries.expand(B, -1, -1, -1)  # [B, T, 1, D]
-            # 直接在每帧 [image..., state] 后追加 query，得到 [image..., state, query]
-            ctx = torch.cat([context, queries], dim=-2).reshape(B, -1, D)  # [B, T*(hw+2), D]
-        else:
-            queries = self.queries.expand(B, -1, -1)  # [B, n, D]
-            # 输入已为 [image..., state]，直接展平后追加全局 query
-            ctx = context.reshape(B, -1, D)
-            queries = self.q_cross_attn(queries, ctx)
-            ctx = torch.cat([ctx, queries], dim=1)
-        # 依次通过每个 QFormerBlock
+        queries = self.queries.expand(B, -1, -1)  # [B, n, D]
+        ctx = context.reshape(B, -1, D)
+        queries = self.q_cross_attn(queries, ctx)
+        ctx = torch.cat([ctx, queries], dim=1)
         for layer in self.layers:
             ctx = layer(ctx, src_mask=self.src_mask)
-        if self.ar_query:
-            return ctx.reshape(B, T, -1, self.query_dim)[:,1:,-1,:] #B,T-1,D    
-        else:
-            return ctx[:, -self.num_queries:,:]   #B,n,D
-    
+        return ctx[:, -self.num_queries:, :]  # [B, n, D]
+
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
@@ -871,7 +809,7 @@ class PatchEmbed(nn.Module):
       
 class Attn_Crossn_Block(nn.Module):
     """
-    LAMDecoder 的核心构建块。
+    Decoder 的核心构建块（可选用于动作-状态融合）。
     它将“动作”信息 (z_q) 融合到“状态”特征 (f_t) 中。
     """
     def __init__(self, feature_dim, num_heads=8, ffn_expansion_factor=4, dropout=0.1):

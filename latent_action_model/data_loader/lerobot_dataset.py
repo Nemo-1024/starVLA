@@ -9,6 +9,10 @@ from torch.utils.data import Dataset
 from starVLA.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.data_config_lam import (
     build_lam_state_normalize_transform,
+    filter_lam_video_keys,
+)
+from starVLA.dataloader.gr00t_lerobot.image_preprocess import (
+    preprocess_video_frames_nhwc,
 )
 from starVLA.dataloader.gr00t_lerobot.datasets import (
     LeRobotMixtureDataset,
@@ -17,7 +21,6 @@ from starVLA.dataloader.gr00t_lerobot.datasets import (
 )
 from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG
-from starVLA.dataloader.gr00t_lerobot.video import DECORD_AVAILABLE, TORCHCODEC_AVAILABLE
 
 
 def _build_modality_config(
@@ -25,9 +28,6 @@ def _build_modality_config(
     num_frames: int,
     preferred_video_key: Optional[str] = None,
     state_keys: Optional[Sequence[str]] = None,
-    frame_stride: int = 1,
-    video_delta_indices: Optional[Sequence[int]] = None,
-    state_delta_indices: Optional[Sequence[int]] = None,
     include_action: bool = False,
     include_language: bool = False,
 ) -> Dict[str, ModalityConfig]:
@@ -35,36 +35,24 @@ def _build_modality_config(
     Clone ROBOT_TYPE_CONFIG_MAP[robot_type].modality_config() and override delta_indices.
     We only keep video/state by default to reduce IO for LAM.
     """
+    if num_frames < 1:
+        raise ValueError(f"num_frames must be >= 1, got {num_frames}")
     base_cfg = ROBOT_TYPE_CONFIG_MAP[robot_type].modality_config()
+    default_delta = list(range(num_frames))
 
-    def _default_delta_indices() -> list[int]:
-        if frame_stride <= 0:
-            raise ValueError(f"frame_stride must be a positive int, got {frame_stride}")
-        # Example: num_frames=5, frame_stride=2 -> [0,2,4,6,8]
-        return list(range(0, num_frames * frame_stride, frame_stride))
-
-    def override_delta(
-        cfg: ModalityConfig,
-        keys: Optional[Sequence[str]],
-        delta_indices: Optional[Sequence[int]] = None,
-    ) -> ModalityConfig:
+    def override_delta(cfg: ModalityConfig, keys: Optional[Sequence[str]]) -> ModalityConfig:
         new_keys = list(keys) if keys is not None else cfg.modality_keys
-        if delta_indices is None:
-            delta_list = _default_delta_indices()
-        else:
-            delta_list = list(delta_indices)
-            if len(delta_list) == 0:
-                raise ValueError("delta_indices must be non-empty if provided.")
-        return ModalityConfig(delta_indices=delta_list, modality_keys=new_keys)
+        return ModalityConfig(delta_indices=list(default_delta), modality_keys=new_keys)
 
     # video
-    video_keys = base_cfg["video"].modality_keys
-    if preferred_video_key and preferred_video_key in video_keys:
-        video_keys = [preferred_video_key]
-    video_modality = override_delta(base_cfg["video"], video_keys, video_delta_indices)
+    video_keys = filter_lam_video_keys(
+        base_video_keys=base_cfg["video"].modality_keys,
+        preferred_video_key=preferred_video_key,
+    )
+    video_modality = override_delta(base_cfg["video"], video_keys)
 
     # state
-    state_modality = override_delta(base_cfg["state"], state_keys, state_delta_indices)
+    state_modality = override_delta(base_cfg["state"], state_keys)
 
     modality_configs: Dict[str, ModalityConfig] = {
         "video": video_modality,
@@ -79,6 +67,17 @@ def _build_modality_config(
     return modality_configs
 
 
+def _build_temporal_delta_indices(num_frames: int, frame_dt_sec: float, fps: float) -> np.ndarray:
+    if num_frames < 1:
+        raise ValueError(f"num_frames must be >= 1, got {num_frames}")
+    if frame_dt_sec <= 0:
+        raise ValueError(f"frame_dt_sec must be > 0, got {frame_dt_sec}")
+    if fps <= 0:
+        raise ValueError(f"fps must be > 0, got {fps}")
+    stride = max(1, int(round(frame_dt_sec * fps)))
+    return np.arange(0, num_frames * stride, stride, dtype=np.int64)
+
+
 class LeRobotLAMDataset(Dataset):
     """
     Mixture dataset that reuses starVLA's LeRobot loaders but emits LAM-ready raw samples.
@@ -87,7 +86,7 @@ class LeRobotLAMDataset(Dataset):
         {
             "frames": torch.Tensor[T, H, W, C] uint8,
             "proprio": torch.Tensor[T, D] float32,
-            "dataset_id": int,
+            "embodiment_id": int,
         }
     """
 
@@ -96,39 +95,33 @@ class LeRobotLAMDataset(Dataset):
         data_root_dir: str | Path,
         data_mix: str,
         num_frames: int,
-        video_backend: str = "torchvision_av",
+        video_backend: str = "pyav",
         preferred_video_key: Optional[str] = None,
         state_keys: Optional[Sequence[str]] = None,
-        frame_dt_sec: Optional[float] = None,
-        frame_stride: int = 1,
-        video_delta_indices: Optional[Sequence[int]] = None,
-        state_delta_indices: Optional[Sequence[int]] = None,
+        *,
+        frame_dt_sec: float,
         max_retries: int = 5,
         debug_repeat_batch: Union[bool, int] = False,
     ) -> None:
         super().__init__()
+        if num_frames < 1:
+            raise ValueError(f"num_frames must be >= 1, got {num_frames}")
+        if frame_dt_sec <= 0:
+            raise ValueError(f"frame_dt_sec must be > 0, got {frame_dt_sec}")
+
         self.data_root_dir = Path(data_root_dir)
         self.data_mix = data_mix
         self.num_frames = num_frames
         self.preferred_video_key = preferred_video_key
         self.state_keys = list(state_keys) if state_keys else None
         self.frame_dt_sec = frame_dt_sec
-        self.frame_stride = frame_stride
-        self.video_delta_indices = list(video_delta_indices) if video_delta_indices is not None else None
-        self.state_delta_indices = list(state_delta_indices) if state_delta_indices is not None else None
         self.max_retries = max_retries
 
         # "auto" 选择在不同环境里更稳健：
         # - 优先 decord（通常最快）
         # - 其次 torchcodec
         # - 否则回退到 torchvision_av
-        if video_backend == "auto":
-            if DECORD_AVAILABLE:
-                video_backend = "decord"
-            elif TORCHCODEC_AVAILABLE:
-                video_backend = "torchcodec"
-            else:
-                video_backend = "torchvision_av"
+
         self.video_backend = video_backend
         
         # Debug mode: cache and repeat samples
@@ -145,8 +138,6 @@ class LeRobotLAMDataset(Dataset):
         # dedupe (dataset_name, robot_type)
         seen: set[Tuple[str, str]] = set()
         dataset_mixture: List[Tuple[LeRobotSingleDataset, float]] = []
-        self.dataset_id_mapping: Dict[int, str] = {}
-        self._dataset_object_to_id: Dict[int, int] = {}
 
         for dataset_name, weight, robot_type in mixture_spec:
             key = (dataset_name, robot_type)
@@ -157,9 +148,6 @@ class LeRobotLAMDataset(Dataset):
             modality_cfg = _build_modality_config(
                 robot_type=robot_type,
                 num_frames=self.num_frames,
-                frame_stride=self.frame_stride,
-                video_delta_indices=self.video_delta_indices,
-                state_delta_indices=self.state_delta_indices,
                 preferred_video_key=self.preferred_video_key,
                 state_keys=self.state_keys,
                 include_action=False,
@@ -183,10 +171,8 @@ class LeRobotLAMDataset(Dataset):
                 transforms=lam_transform,
                 data_cfg=data_cfg,
             )
-            new_idx = len(dataset_mixture)
+            self._apply_temporal_delta_indices(ds)
             dataset_mixture.append((ds, weight))
-            self.dataset_id_mapping[new_idx] = dataset_name
-            self._dataset_object_to_id[id(ds)] = new_idx
 
         self.mixture = LeRobotMixtureDataset(
             dataset_mixture,
@@ -196,39 +182,29 @@ class LeRobotLAMDataset(Dataset):
             data_cfg=data_cfg,
         )
 
-    def _maybe_override_delta_indices_by_dt(self, dataset: LeRobotSingleDataset) -> None:
-        """
-        If frame_dt_sec is set (and explicit delta indices are not provided), override
-        video/state delta_indices to approximate a constant time interval in seconds,
-        using the dataset video fps.
+    def _apply_temporal_delta_indices(self, dataset: LeRobotSingleDataset) -> None:
+        video_keys = dataset.modality_keys.get("video", [])
+        if not video_keys:
+            raise RuntimeError(f"Dataset {dataset.dataset_name} has no video keys configured.")
 
-        Note: this assumes the trajectory "step" timestamps align reasonably with video timestamps.
-        """
-        if self.frame_dt_sec is None:
-            return
-        if self.video_delta_indices is not None or self.state_delta_indices is not None:
-            return
-
-        if self.frame_dt_sec <= 0:
-            raise ValueError(f"frame_dt_sec must be > 0, got {self.frame_dt_sec}")
-
-        if not dataset.modality_keys.get("video"):
-            return
-
-        # Pick the first configured video key (LAM usually narrows to 1 via preferred_video_key).
-        video_key_full = dataset.modality_keys["video"][0]
+        # Use preferred view if present; otherwise fallback to the first configured view.
+        video_key_full = (
+            self.preferred_video_key
+            if self.preferred_video_key and self.preferred_video_key in video_keys
+            else video_keys[0]
+        )
         video_subkey = video_key_full.replace("video.", "")
         fps = float(dataset.metadata.modalities.video[video_subkey].fps)
-        stride = max(1, int(round(self.frame_dt_sec * fps)))
+        delta_arr = _build_temporal_delta_indices(
+            num_frames=self.num_frames,
+            frame_dt_sec=self.frame_dt_sec,
+            fps=fps,
+        )
 
-        delta_list = list(range(0, self.num_frames * stride, stride))
-        delta_arr = np.array(delta_list, dtype=np.int64)
-
-        # Override in-place for all configured video/state keys in this dataset instance.
-        for k in dataset.modality_keys.get("video", []):
-            dataset._delta_indices[k] = delta_arr
+        for k in video_keys:
+            dataset._delta_indices[k] = delta_arr.copy()
         for k in dataset.modality_keys.get("state", []):
-            dataset._delta_indices[k] = delta_arr
+            dataset._delta_indices[k] = delta_arr.copy()
 
     def __len__(self) -> int:
         # In debug mode, return a large virtual length to support multiple epochs
@@ -238,7 +214,6 @@ class LeRobotLAMDataset(Dataset):
 
     def _try_get_sample(self, index: int) -> Dict:
         dataset, traj_id, base_index = self.mixture.sample_step(index)
-        self._maybe_override_delta_indices_by_dt(dataset)
         raw_data = dataset.get_step_data(traj_id, base_index)
         data = dataset.transforms(raw_data)
 
@@ -249,6 +224,7 @@ class LeRobotLAMDataset(Dataset):
         else:
             video_key = available_video_keys[0]
         frames = data[video_key]  # (T, H, W, C)
+        frames = preprocess_video_frames_nhwc(frames)
         if isinstance(frames, torch.Tensor):
             frames_t = frames
             if frames_t.dtype != torch.uint8:
@@ -270,12 +246,12 @@ class LeRobotLAMDataset(Dataset):
             raise RuntimeError("No state keys found for LAM dataset.")
         proprio = torch.cat(proprio_tensors, dim=-1).contiguous()
 
-        dataset_id = self._dataset_object_to_id.get(id(dataset), 0)
+        embodiment_id = int(dataset.embodiment_id)
 
         return {
             "frames": frames_t,
             "proprio": proprio,
-            "dataset_id": dataset_id,
+            "embodiment_id": embodiment_id,
         }
 
     def __getitem__(self, index: int) -> Dict:

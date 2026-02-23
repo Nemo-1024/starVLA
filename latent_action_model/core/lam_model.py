@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from .vq import VQ, NSVQ, EMAVQ, AEQuantizer
 from .vjepa_encoder import build_vision_encoder, DINOv3Encoder
 
@@ -10,8 +10,9 @@ import torch
 import torch.nn as nn
 import math
 import yaml
+from latent_action_model.data_loader.video_aug import LAM_GRID_HW, LAM_IMAGE_HW, LAM_PATCH_SIZE
 from .utils.lam_encoder import LAMEncoder
-from .utils.lam_decoder import LAMDecoder, LAMDecoder_v2, StatePredictor
+from .utils.lam_decoder import LAMDecoder_v2, StatePredictor
 from .utils.modules import PatchEmbed
 
 
@@ -34,7 +35,6 @@ class LatentLAMModel(nn.Module):
         max_state_dim: int = 32,
         num_frames: int = 5,
         num_queries: int = 1,
-        ar_prediction: bool = False,
         vq_kwargs: Optional[Dict[str, Any]] = None,
         dec_layers: int = 6,
         dropout: float = 0.1,
@@ -49,11 +49,33 @@ class LatentLAMModel(nn.Module):
         enc_modal_mask: bool = False,
         latent_layer_to_use: Any = 23,
         multi_input: bool = False,
-        dataset_vocab_size: int = 16,
+        num_embodiments: int = 32,
+        image_hw: Tuple[int, int] = LAM_IMAGE_HW,
+        patch_size: int = LAM_PATCH_SIZE,
         **kwargs
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.image_hw = (int(image_hw[0]), int(image_hw[1]))
+        self.patch_size = int(patch_size)
+        if self.image_hw != LAM_IMAGE_HW:
+            raise ValueError(
+                f"Unsupported image_hw={self.image_hw}. Only {LAM_IMAGE_HW} is supported."
+            )
+        if self.patch_size != LAM_PATCH_SIZE:
+            raise ValueError(
+                f"Unsupported patch_size={self.patch_size}. Only {LAM_PATCH_SIZE} is supported."
+            )
+        if self.image_hw[0] % self.patch_size != 0 or self.image_hw[1] % self.patch_size != 0:
+            raise ValueError(
+                f"image_hw={self.image_hw} must be divisible by patch_size={self.patch_size}."
+            )
+        self.grid_height = self.image_hw[0] // self.patch_size
+        self.grid_width = self.image_hw[1] // self.patch_size
+        if (self.grid_height, self.grid_width) != LAM_GRID_HW:
+            raise ValueError(
+                f"Unsupported grid_hw={(self.grid_height, self.grid_width)}. Only {LAM_GRID_HW} is supported."
+            )
         # 集成视觉编码器：负责将 videos 编码为 [B, T, N, D] 特征
         # 依据 latent_layer_to_use 的长度控制 DINO 中 BatchNorm 的个数：
         # - 若为单层（int），只需一个 BN
@@ -72,58 +94,60 @@ class LatentLAMModel(nn.Module):
         self.code_dim = code_dim
         if encoder_obj is None:
             # 未使用预训练视觉编码器，回退到可学习的 PatchEmbed 层
-            self.vision_encoder = PatchEmbed(patch_size=16, embed_dim=dim, in_chans=3).to(self.device)
+            self.vision_encoder = PatchEmbed(patch_size=self.patch_size, embed_dim=dim, in_chans=3).to(self.device)
             self.input_dim = self.vision_encoder.feature_dim
             self.train_in_latent = False
         else:
             self.vision_encoder = encoder_obj.to(self.device)
             self.input_dim = input_dim
             self.train_in_latent = True
-        self.ar_prediction = ar_prediction
         self.num_frames = num_frames
         self.num_queries = num_queries
+        self.num_embodiments = int(num_embodiments)
         self.feature_decoder = None
         self.state_decoder = None
-        if self.ar_prediction:
-            self.frame_to_pre = self.num_frames - 1
-            self.decoder = LAMDecoder(
-                context_dim=dim,
-                input_dim=self.input_dim,
-                frame_to_pre=self.frame_to_pre,
-                num_layers=dec_layers,
-                num_heads=num_heads,
-                dropout=dropout,
-                train_in_latent=self.train_in_latent,
-                ffn_expansion_factor=ffn_expansion_factor,
-                dataset_vocab_size=dataset_vocab_size,
-                code_dim=code_dim,
-            ).to(self.device)
-        else:
-            self.frame_to_pre = 1
-            self.decoder = LAMDecoder_v2(
-                context_dim=dim,
-                input_dim=self.input_dim,
-                num_queries=num_queries,
-                num_layers=dec_layers,
-                num_heads=num_heads,
-                dropout=dropout,
-                train_in_latent=self.train_in_latent,
-                ffn_expansion_factor=ffn_expansion_factor,
-                dataset_vocab_size=dataset_vocab_size,
-                code_dim=code_dim,
-            ).to(self.device)
-            self.state_decoder = StatePredictor(
-                latent_dim=dim,
-                dropout=dropout,
-                num_datasets=dataset_vocab_size,
-                num_queries=num_queries,
-                code_dim=code_dim,
-            ).to(self.device)
+        self.frame_to_pre = 1
+        self.decoder = LAMDecoder_v2(
+            context_dim=dim,
+            input_dim=self.input_dim,
+            num_queries=num_queries,
+            num_layers=dec_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            train_in_latent=self.train_in_latent,
+            ffn_expansion_factor=ffn_expansion_factor,
+            num_embodiments=self.num_embodiments,
+            code_dim=code_dim,
+            grid_hw=(self.grid_height, self.grid_width),
+        ).to(self.device)
+        self.state_decoder = StatePredictor(
+            latent_dim=dim,
+            dropout=dropout,
+            num_embodiments=self.num_embodiments,
+            num_queries=num_queries,
+            max_state_dim=max_state_dim,
+            code_dim=code_dim,
+        ).to(self.device)
         self.norm_latents = norm_latents
         # print("norm_latents:", self.norm_latents)
         self.norm_latents_type = norm_latents_type
         self.vq_type = vq_type
-        self.encoder = LAMEncoder(context_dim=dim, input_dim=2*self.input_dim if multi_input else self.input_dim, ar_query=self.ar_prediction, add_state=enc_add_state, modal_mask=enc_modal_mask, num_layers=enc_layers, num_heads=num_heads, dropout=dropout, ffn_expansion_factor=ffn_expansion_factor, num_frames=self.num_frames, num_queries=num_queries, code_dim=code_dim).to(self.device)
+        self.encoder = LAMEncoder(
+            context_dim=dim,
+            input_dim=2 * self.input_dim if multi_input else self.input_dim,
+            add_state=enc_add_state,
+            modal_mask=enc_modal_mask,
+            num_layers=enc_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            ffn_expansion_factor=ffn_expansion_factor,
+            num_frames=self.num_frames,
+            grid_hw=(self.grid_height, self.grid_width),
+            num_queries=num_queries,
+            max_state_dim=max_state_dim,
+            num_embodiments=self.num_embodiments,
+            code_dim=code_dim,
+        ).to(self.device)
         self.latent_layer_to_use = latent_layer_to_use
         self.multi_input = multi_input
         vq_kwargs = vq_kwargs or {}
@@ -173,7 +197,118 @@ class LatentLAMModel(nn.Module):
         #         dropout=dropout
         #     ).to(self.device)
         self.codebook_size = codebook_size
-    def forward(self, videos: torch.Tensor, states: torch.Tensor, dec_videos: torch.Tensor, dataset_ids: Optional[Any] = None):
+    def _resolve_states(
+        self,
+        *,
+        videos: torch.Tensor,
+        states: Optional[torch.Tensor],
+        state_mask: Optional[torch.Tensor],
+        require_states: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        expected_dim = int(getattr(getattr(self, "encoder", None), "max_state_dim", 0) or 0)
+        if expected_dim <= 0:
+            raise ValueError("[LatentLAMModel] encoder.max_state_dim must be > 0.")
+
+        if states is None:
+            if require_states:
+                raise ValueError("[LatentLAMModel] `states` is required for training/inference.")
+            if videos.ndim < 2:
+                raise ValueError(f"[LatentLAMModel] invalid videos shape: {tuple(videos.shape)}")
+            fallback_t = int(videos.shape[1])
+            if fallback_t <= 0:
+                raise ValueError("[LatentLAMModel] videos must have positive temporal length.")
+            state_dtype = videos.dtype if torch.is_floating_point(videos) else torch.float32
+            states = torch.zeros(
+                videos.shape[0],
+                fallback_t,
+                expected_dim,
+                dtype=state_dtype,
+                device=videos.device,
+            )
+        else:
+            if not isinstance(states, torch.Tensor):
+                states = torch.as_tensor(states)
+            states = states.to(device=videos.device)
+            if states.ndim == 4 and states.size(-2) == 1:
+                states = states.squeeze(-2)
+            if states.ndim != 3:
+                raise ValueError(
+                    f"[LatentLAMModel] `states` must be [B,T,D] or [B,T,1,D], got {tuple(states.shape)}"
+                )
+            if states.shape[0] != videos.shape[0]:
+                raise ValueError(
+                    f"[LatentLAMModel] batch mismatch: videos B={videos.shape[0]} vs states B={states.shape[0]}"
+                )
+            if require_states and states.shape[1] != 2:
+                raise ValueError(
+                    f"[LatentLAMModel] training/inference expects endpoint states with T=2, got T={states.shape[1]}"
+                )
+            if states.shape[-1] != expected_dim:
+                raise ValueError(
+                    f"[LatentLAMModel] states dim mismatch: got D={states.shape[-1]}, expected {expected_dim}"
+                )
+
+        if state_mask is not None:
+            if not isinstance(state_mask, torch.Tensor):
+                state_mask = torch.as_tensor(state_mask)
+            state_mask = state_mask.to(device=videos.device)
+            if state_mask.ndim == 2:
+                if state_mask.shape != (states.shape[0], states.shape[-1]):
+                    raise ValueError(
+                        f"[LatentLAMModel] 2D state_mask must be [B,D], got {tuple(state_mask.shape)}"
+                    )
+                state_mask = state_mask[:, None, :].expand(-1, states.shape[1], -1)
+            elif state_mask.ndim == 3:
+                if state_mask.shape != states.shape:
+                    raise ValueError(
+                        f"[LatentLAMModel] state_mask shape mismatch: mask={tuple(state_mask.shape)} vs states={tuple(states.shape)}"
+                    )
+            else:
+                raise ValueError(
+                    f"[LatentLAMModel] state_mask must be [B,D] or [B,T,D], got {tuple(state_mask.shape)}"
+                )
+            state_mask = state_mask.to(torch.bool)
+
+        return states, state_mask
+
+    def _resolve_embodiment_ids(
+        self,
+        embodiment_ids: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        device: torch.device,
+        require_embodiment_ids: bool,
+    ) -> torch.Tensor:
+        if embodiment_ids is None:
+            if require_embodiment_ids:
+                raise KeyError("[LatentLAMModel] `embodiment_ids` is required for training.")
+            return torch.zeros(batch_size, device=device, dtype=torch.long)
+
+        if not isinstance(embodiment_ids, torch.Tensor):
+            raise TypeError(
+                f"[LatentLAMModel] `embodiment_ids` must be torch.Tensor or None, got {type(embodiment_ids).__name__}"
+            )
+        emb = embodiment_ids
+        if emb.ndim == 2 and emb.size(1) == 1:
+            emb = emb.squeeze(1)
+        elif emb.ndim != 1:
+            raise ValueError(
+                f"[LatentLAMModel] `embodiment_ids` must be [B] or [B,1], got {tuple(emb.shape)}"
+            )
+        if emb.shape[0] != batch_size:
+            raise ValueError(
+                f"[LatentLAMModel] embodiment_ids batch mismatch: got {emb.shape[0]}, expected {batch_size}"
+            )
+        return emb.to(device=device, dtype=torch.long)
+
+    def forward(
+        self,
+        videos: torch.Tensor,
+        states: Optional[torch.Tensor],
+        dec_videos: torch.Tensor,
+        state_mask: Optional[torch.Tensor] = None,
+        embodiment_ids: Optional[torch.Tensor] = None,
+    ):
         """
         Args:
             videos: 视频帧张量，形状取决于 VJEPAEncoder 的实现，例如 [B, T, C, H, W]
@@ -186,17 +321,29 @@ class LatentLAMModel(nn.Module):
                 delta_s_pred: [B, 3] 预测的状态差（如果启用）或 None
                 features: [B, T, N, D] 由视觉编码器得到的特征
         """
-        return self._run(videos=videos, states=states, dec_videos=dec_videos, dataset_ids=dataset_ids, vq_training=True)
+        return self._run(
+            videos=videos,
+            states=states,
+            dec_videos=dec_videos,
+            state_mask=state_mask,
+            embodiment_ids=embodiment_ids,
+            vq_training=True,
+            require_states=True,
+            require_embodiment_ids=True,
+        )
 
     
     def _run(
         self,
         videos: torch.Tensor,   #[B, T, C,H,W]
-        states: torch.Tensor,  #[B,T,8]
+        states: Optional[torch.Tensor],  #[B,T,D]
         dec_videos: torch.Tensor,  #[B,T,C,H,W]
-        dataset_ids: Optional[Any] = None,
+        state_mask: Optional[torch.Tensor] = None,
+        embodiment_ids: Optional[torch.Tensor] = None,
         user_specific: Optional[int] = None,
         vq_training: bool = True,
+        require_states: bool = False,
+        require_embodiment_ids: bool = False,
         predict_future_frame: bool = True,
         return_vq_probs: bool = False,
         vq_temperature: float = 1.0,
@@ -211,11 +358,25 @@ class LatentLAMModel(nn.Module):
         Returns:
             (recon, perplexity, indices, delta_s_pred, features, quantized, codebook_loss, entropy_loss, commitment_loss)
         """
+        states, state_mask = self._resolve_states(
+            videos=videos,
+            states=states,
+            state_mask=state_mask,
+            require_states=require_states,
+        )
+        emb_tensor = self._resolve_embodiment_ids(
+            embodiment_ids=embodiment_ids,
+            batch_size=int(states.shape[0]),
+            device=self.device,
+            require_embodiment_ids=require_embodiment_ids,
+        )
+        del state_mask  # reserved for future loss usage / masking strategies
+
         # 冻结视觉编码器参数，与原 Lightning 行为保持一致
+        T = videos.shape[1]
         
         if self.train_in_latent:
             # 使用预训练视觉编码器：一次性编码 [videos, dec_videos]，避免重复前向
-            T = videos.shape[1]
             cat_videos = torch.cat([videos, dec_videos], dim=1)
             all_features = self.vision_encoder.encode(
                 cat_videos,
@@ -240,16 +401,10 @@ class LatentLAMModel(nn.Module):
                 enc_feats = dec_feats = all_features
 
             enc_in = enc_feats[:, :T]  # [B, T, K, D]
-            if not self.ar_prediction:
-                # 非自回归：仅预测最后一帧
-                dec_in = dec_feats[:, T : T + 1]  # [B, 1, K, D]
-                tgt = dec_feats[:, -1:]  # [B, 1, K, D]
-                dec_states = states[:, :1]
-            else:
-                # 自回归：预测后续 T-1 帧
-                dec_in = dec_feats[:, T : T * 2 - 1]  # [B, T-1, K, D]
-                tgt = dec_feats[:, T + 1 :]  # [B, T-1, K, D]
-                dec_states = states[:, : T - 1]  # [B, T-1, 8]
+            # 非自回归：仅预测最后一帧
+            dec_in = dec_feats[:, T : T + 1]  # [B, 1, K, D]
+            tgt = dec_feats[:, -1:]  # [B, 1, K, D]
+            dec_states = states[:, :1]
             # print(f"dec_in norm mean:{dec_in.norm(dim=-1).mean()}", "\n")
             # print(f"dec_in norm std:{dec_in.norm(dim=-1).std()}", "\n")
             # 仅在推理或需要可视化时构建 `vision_features`，训练路径下可跳过以减小开销
@@ -258,59 +413,89 @@ class LatentLAMModel(nn.Module):
             else:
                 vision_features = torch.stack([dec_in, tgt], dim=1)
         else:
-            # 未使用预训练视觉编码器时，回退到 PatchEmbed
-            patches = self.vision_encoder.encode(dec_videos)
-            dec_in, tgt = patches[:, :1], patches[:, -1:]
+            # 未使用预训练视觉编码器时，回退到 PatchEmbed，并保持与 latent 编码路径一致的切分语义
+            cat_videos = torch.cat([videos, dec_videos], dim=1)
+            patches = self.vision_encoder.encode(cat_videos)
+            enc_in = patches[:, :T]  # [B, T, K, D]
+            dec_in = patches[:, T : T + 1]  # [B, 1, K, D]
+            tgt = patches[:, -1:]  # [B, 1, K, D]
+            dec_states = states[:, :1]
             vision_features = None if vq_training else torch.stack([dec_in, tgt], dim=1)
 
-        nodes = self.encoder(enc_in, states)  # [B, num_queries, code_dim]
+        nodes = self.encoder(enc_in, states, embodiment_id=emb_tensor)  # [B, num_queries, code_dim]
         # nodes = self.encoder(video_feature)
         # defaults for latent stats (VAE path)
         latent_mu = None
         latent_logvar = None
 
-        with torch.amp.autocast("cuda", enabled=False):
-            vq_distances = None
-            vq_logits = None
-            vq_probs = None
-            zero_tensor = torch.tensor(0.0, device=self.device)
-            if self.vq is not None:
-                if vq_training:
-                    out = self.vq(nodes.float())
-                    quantized, perplexity, indices, entropy_loss, vq_loss = out[:5]
-                    latent_mu = out[5] if len(out) > 5 else None
-                    latent_logvar = out[6] if len(out) > 6 else None
-                else:
-                    if return_vq_probs:
+        vq_distances = None
+        vq_logits = None
+        vq_probs = None
+        zero_tensor = torch.tensor(0.0, device=self.device)
+        # Precision policy is controlled by the caller (training pipeline/framework stage),
+        # so LAM no longer performs implicit dtype fallback/casts here.
+
+        def _raise_vq_dtype_error(exc: RuntimeError) -> None:
+            msg = str(exc)
+            dtype_error = (
+                "must have the same dtype" in msg
+                or "expected scalar type" in msg
+                or "mat1 and mat2" in msg
+            )
+            if dtype_error:
+                raise RuntimeError(
+                    "[LatentLAMModel] VQ dtype mismatch detected. "
+                    "Precision policy should be aligned at the caller boundary "
+                    "(do not rely on implicit casts inside LAM)."
+                ) from exc
+            raise exc
+
+        if self.vq is not None:
+            if vq_training:
+                try:
+                    out = self.vq(nodes)
+                except RuntimeError as exc:
+                    _raise_vq_dtype_error(exc)
+                quantized, perplexity, indices, entropy_loss, vq_loss = out[:5]
+                latent_mu = out[5] if len(out) > 5 else None
+                latent_logvar = out[6] if len(out) > 6 else None
+            else:
+                if return_vq_probs:
+                    try:
                         out = self.vq.inference(
-                            nodes.float(),
+                            nodes,
                             user_specific=user_specific,
                             return_distance=True,
                             return_logits=True,
                             return_probs=True,
                             temperature=vq_temperature,
                         )
-                        quantized, indices, vq_distances, vq_logits, vq_probs = out[:5]
-                    else:
-                        out = self.vq.inference(nodes.float(), user_specific=user_specific)
-                        quantized, indices = out[:2]
-                    latent_mu = None
-                    latent_logvar = None
-                    perplexity = zero_tensor
-                    entropy_loss = zero_tensor
-                    vq_loss = zero_tensor
-            else:
-                # Fallback: should not happen, but keep behavior consistent
-                quantized = nodes.float()
-                indices = torch.zeros(
-                    (nodes.shape[0], nodes.shape[1]), device=self.device, dtype=torch.long
-                )
+                    except RuntimeError as exc:
+                        _raise_vq_dtype_error(exc)
+                    quantized, indices, vq_distances, vq_logits, vq_probs = out[:5]
+                else:
+                    try:
+                        out = self.vq.inference(nodes, user_specific=user_specific)
+                    except RuntimeError as exc:
+                        _raise_vq_dtype_error(exc)
+                    quantized, indices = out[:2]
+                latent_mu = None
+                latent_logvar = None
                 perplexity = zero_tensor
                 entropy_loss = zero_tensor
                 vq_loss = zero_tensor
-                vq_distances = None
-                vq_logits = None
-                vq_probs = None
+        else:
+            # Fallback: should not happen, but keep behavior consistent
+            quantized = nodes
+            indices = torch.zeros(
+                (nodes.shape[0], nodes.shape[1]), device=self.device, dtype=torch.long
+            )
+            perplexity = zero_tensor
+            entropy_loss = zero_tensor
+            vq_loss = zero_tensor
+            vq_distances = None
+            vq_logits = None
+            vq_probs = None
 
         # Ensure indices exist when quantizer returns None (e.g., VAE/AE paths)
         if indices is None:
@@ -328,21 +513,10 @@ class LatentLAMModel(nn.Module):
         s_pred = None
         # delta_s_pred = self.state_delta_predictor(quantized, state_0=states[:,0])
         if predict_future_frame:
-            # dataset_ids: Optional[List[int] | Tensor] -> Tensor on device
-            if dataset_ids is None:
-                ds_tensor = torch.zeros(states.shape[0], device=self.device, dtype=torch.long)
-            else:
-                ds_tensor = torch.as_tensor(dataset_ids, device=self.device, dtype=torch.long)
-                if ds_tensor.dim() > 1:
-                    ds_tensor = ds_tensor.view(ds_tensor.shape[0])
-            if self.ar_prediction:
-                # 使用潜动作表示进行解码；当禁用 VQ 时，quantized 等同于 nodes
-                recon, s_pred = self.decoder(features=dec_in, actions=quantized, states=dec_states, dataset_id=ds_tensor)
-            else:
-                # 并行解码：特征重建与状态预测解耦
-                recon = self.decoder(features=dec_in, actions=quantized)
-                if self.state_decoder is not None:
-                    s_pred = self.state_decoder(z_t=quantized, state_0=dec_states, dataset_id=ds_tensor)
+            # 并行解码：特征重建与状态预测解耦
+            recon = self.decoder(features=dec_in, actions=quantized)
+            if self.state_decoder is not None:
+                s_pred = self.state_decoder(z_t=quantized, state_0=dec_states, embodiment_id=emb_tensor)
         # with torch.no_grad():
         #     print(tgt.mean(), tgt.std())
         #     delta = tgt-dec_in
@@ -380,24 +554,42 @@ class LatentLAMModel(nn.Module):
         )
         
     @torch.inference_mode()
-    def inference(self, videos: torch.Tensor, states: torch.Tensor, dec_videos: torch.Tensor, dataset_ids: Optional[Any] = None):
-        return self._run(videos=videos, states=states, dec_videos=dec_videos, dataset_ids=dataset_ids, vq_training=False, predict_future_frame=True)
-
-    @torch.inference_mode()
-    def vq_encode(
+    def inference(
         self,
         videos: torch.Tensor,
-        states: torch.Tensor,
+        states: Optional[torch.Tensor],
+        dec_videos: torch.Tensor,
+        state_mask: Optional[torch.Tensor] = None,
+        embodiment_ids: Optional[torch.Tensor] = None,
+    ):
+        return self._run(
+            videos=videos,
+            states=states,
+            dec_videos=dec_videos,
+            state_mask=state_mask,
+            embodiment_ids=embodiment_ids,
+            vq_training=False,
+            require_states=True,
+            require_embodiment_ids=False,
+            predict_future_frame=True,
+        )
+
+    @torch.inference_mode()
+    def get_latent_action(
+        self,
+        videos: torch.Tensor,
+        states: Optional[torch.Tensor],
         dec_videos: Optional[torch.Tensor] = None,
+        state_mask: Optional[torch.Tensor] = None,
         predict_future_frame: bool = False,
         user_specific=None,
-        dataset_ids: Optional[Any] = None,
+        embodiment_ids: Optional[torch.Tensor] = None,
         return_teacher_probs: bool = False,
         teacher_temperature: float = 1.0,
     ):
         """
         推理流程：复用 `_run` 中与训练一致的视觉编码与多层特征逻辑：
-        videos/states[/dec_videos] -> 视觉编码 -> 编码 -> VQ.inference(user_specific)。
+        videos/states[/dec_videos] -> 视觉编码 -> 编码 -> 码本推理（user_specific）。
 
         - 当 `predict_future_frame=False` 时，内部仍会按照 `_run` 的逻辑构造 enc/dec 特征，
           但不会调用 Decoder，仅做离散动作推理（indices/quantized），适用于 VLA 等纯编码场景。
@@ -412,10 +604,13 @@ class LatentLAMModel(nn.Module):
                 videos=videos,
                 states=states,
                 dec_videos=dec_videos,
+                state_mask=state_mask,
                 user_specific=user_specific,
                 vq_training=False,
+                require_states=False,
                 predict_future_frame=predict_future_frame,
-                dataset_ids=dataset_ids,
+                embodiment_ids=embodiment_ids,
+                require_embodiment_ids=False,
                 return_vq_probs=return_teacher_probs,
                 vq_temperature=teacher_temperature,
             )
@@ -456,10 +651,13 @@ class LatentLAMModel(nn.Module):
                 videos=videos,
                 states=states,
                 dec_videos=dec_videos,
+                state_mask=state_mask,
                 user_specific=user_specific,
                 vq_training=False,
+                require_states=False,
                 predict_future_frame=predict_future_frame,
-                dataset_ids=dataset_ids,
+                embodiment_ids=embodiment_ids,
+                require_embodiment_ids=False,
                 return_vq_probs=return_teacher_probs,
                 vq_temperature=teacher_temperature,
             )
@@ -486,14 +684,16 @@ class LatentLAMModel(nn.Module):
         }
 
     @torch.no_grad()
-    def extract_dino_features(self, videos: torch.Tensor, *, n: Optional[Any] = -2) -> torch.Tensor:
+    def extract_vision_features(self, videos: torch.Tensor, *, n: Optional[Any] = -2) -> torch.Tensor:
         """
-        仅提取视觉编码器的特征（不经过 VQ/decoder），返回 [B, T, K, D]。
+        仅提取视觉编码器特征（不经过 VQ/decoder），返回 [B, T, K, D]。
         若 latent_layer_to_use 是列表且 encoder 返回多层，则取最后一层。
         """
-        # 对齐 latent_layer_to_use 的行为
         n_used = n if n is not None else self.latent_layer_to_use
-        feats = self.vision_encoder.encode(videos, n=n_used)
+        try:
+            feats = self.vision_encoder.encode(videos, n=n_used)
+        except TypeError:
+            feats = self.vision_encoder.encode(videos)
         if isinstance(feats, (list, tuple)):
             feats = feats[-1]
         return feats
@@ -504,8 +704,13 @@ def load_latent_action_model(ckpt_path, yaml_path):
         cfg = yaml.safe_load(f)
     model_cfg = cfg.get('model', cfg) or {}
 
+    if "image_hw" not in model_cfg:
+        raise ValueError("LAM config must provide `model.image_hw` (expected [256, 256]).")
+    if "patch_size" not in model_cfg:
+        raise ValueError("LAM config must provide `model.patch_size` (expected 16).")
 
-    init_kwargs = model_cfg
+    init_kwargs = dict(model_cfg)
+    init_kwargs.pop("ar_prediction", None)  # 已移除，兼容旧配置
 
     # 3) 构建模型（放置到 CPU 以保证权重加载兼容性）
     latent_action_model = LatentLAMModel(**init_kwargs).to("cpu")
@@ -514,8 +719,6 @@ def load_latent_action_model(ckpt_path, yaml_path):
     lam_ckpt = torch.load(ckpt_path, map_location="cpu")['state_dict']
     new_ckpt = {}
     model_state = latent_action_model.state_dict()
-    has_feature_decoder = any(k.startswith("feature_decoder.") for k in model_state.keys())
-    has_state_decoder = any(k.startswith("state_decoder.") for k in model_state.keys())
     for key in lam_ckpt.keys():
         # 先移除 Lightning 包装前缀
         renamed = key.replace("lam.", "")
@@ -541,11 +744,9 @@ def load_latent_action_model(ckpt_path, yaml_path):
         if shape_mismatches:
             error_lines.append(f"形状不匹配的键数量 {len(shape_mismatches)}：")
             error_lines += [f"  - {k}: 模型{ms} vs 权重{cs}" for k, ms, cs in shape_mismatches]
-        print("\n".join(error_lines))
+        raise RuntimeError("\n".join(error_lines))
 
-    latent_action_model.load_state_dict(new_ckpt, strict=False)
+    latent_action_model.load_state_dict(new_ckpt, strict=True)
     for p in latent_action_model.parameters():
         p.requires_grad = False
     return latent_action_model.eval()
-
-

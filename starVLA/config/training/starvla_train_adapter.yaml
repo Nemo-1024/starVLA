@@ -40,7 +40,7 @@ datasets:
     per_device_batch_size: 16
     load_all_data_for_training: true
     obs: ["image_0"]
-    video_backend: torchvision_av
+    video_backend: pyav
 
 
 trainer:
@@ -66,6 +66,7 @@ trainer:
   logging_frequency: 10
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
+  ddp_find_unused_parameters: true
 
   optimizer:
     name: AdamW
@@ -79,4 +80,3 @@ trainer:
   resume_step: null
   enable_gradient_checkpointing: true
   enable_mixed_precision_training: true
-

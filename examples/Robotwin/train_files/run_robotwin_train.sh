@@ -13,7 +13,7 @@ export NCCL_TIMEOUT=1000  # timeout set to 1 hour (unit: seconds)
 Framework_name=QwenFast
 freeze_module_list=''
 base_vlm=playground/Pretrained_models/Qwen3-VL-4B-Instruct-Action
-config_yaml=./examples/Robotwin/train_files/starvla_cotrain_robotwin.yaml
+config_yaml=./examples/Robotwin/train_files/starvla_train_robotwin.yaml
 run_root_dir=./results/Checkpoints
 data_mix=robotwin
 run_id=1218_${data_mix}_qwen3Fast_debug
@@ -30,7 +30,7 @@ cp $0 ${output_dir}/
 
 
 accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --config_file starVLA/config/accelerate/ddp_bf16.yaml \
   --num_processes 8 \
   starVLA/training/train_starvla.py \
   --config_yaml ${config_yaml} \
@@ -53,7 +53,7 @@ accelerate launch \
 
 ##### Multi-Server Multi-GPU training script #####
   # accelerate launch \
-  #   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  #   --config_file starVLA/config/accelerate/ddp_bf16.yaml \
   #   --main_process_ip $MASTER_ADDR \
   #   --main_process_port $MASTER_PORT \
   #   --machine_rank $SLURM_PROCID \

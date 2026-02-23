@@ -38,9 +38,10 @@ from tqdm import tqdm
 from PIL import Image
 import torch.distributed as dist
 
+from starVLA.dataloader.gr00t_lerobot.image_preprocess import preprocess_pil_image
 from starVLA.dataloader.gr00t_lerobot.video import get_all_frames, get_frames_by_timestamps
 
-from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
+from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EMBODIMENT_TAG_MAPPING, EmbodimentTag
 from starVLA.dataloader.gr00t_lerobot.schema import (
     DatasetMetadata,
     DatasetStatisticalValues,
@@ -63,6 +64,33 @@ LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_TASKS_FILENAME = "meta/tasks.parquet"
 LE_ROBOT_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 EPSILON = 5e-4
+
+
+def _resolve_image_resolution(data_cfg, default: int) -> int:
+    if data_cfg is not None and hasattr(data_cfg, "get"):
+        value = data_cfg.get("image_resolution", None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid `image_resolution`: {value!r}. Expected an integer.")
+    return int(default)
+
+
+def _resolve_embodiment_id_from_tag(tag: str) -> int:
+    if not isinstance(tag, str):
+        raise TypeError(f"`embodiment_tag` must be str, got {type(tag)}.")
+    if tag not in EMBODIMENT_TAG_MAPPING:
+        raise ValueError(
+            f"Unknown embodiment tag `{tag}`. "
+            f"Available tags: {sorted(EMBODIMENT_TAG_MAPPING.keys())}."
+        )
+    mapped_value = EMBODIMENT_TAG_MAPPING[tag]
+    if isinstance(mapped_value, bool) or not isinstance(mapped_value, int):
+        raise TypeError(
+            f"`EMBODIMENT_TAG_MAPPING[{tag}]` must be int, got {type(mapped_value)}."
+        )
+    return int(mapped_value)
 
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
@@ -126,10 +154,11 @@ class LeRobotSingleDataset(Dataset):
         dataset_path: Path | str,
         modality_configs: dict[str, ModalityConfig],
         embodiment_tag: str | EmbodimentTag,
-        video_backend: str = "decord",
+        video_backend: str = "pyav",
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
         data_cfg = None,
+        _force_recompute_stats: bool = False,
         **kwargs,
     ):
         """
@@ -146,8 +175,16 @@ class LeRobotSingleDataset(Dataset):
         """
         # first check if the path directory exists
         self.data_cfg = data_cfg
+        self.image_resolution = _resolve_image_resolution(self.data_cfg, default=224)
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
+        # Internal switch: recompute stats at runtime and overwrite cached file.
+        # Priority: explicit init arg > data_cfg.force_recompute_stats > default(False)
+        self._force_recompute_stats = bool(_force_recompute_stats)
+        if hasattr(self.data_cfg, "get"):
+            self._force_recompute_stats = bool(
+                self.data_cfg.get("force_recompute_stats", self._force_recompute_stats)
+            )
         self.modality_configs = modality_configs
         self.video_backend = video_backend
         self.video_backend_kwargs = dict(video_backend_kwargs) if video_backend_kwargs is not None else {}
@@ -168,6 +205,7 @@ class LeRobotSingleDataset(Dataset):
             self.tag = embodiment_tag.value
         else:
             self.tag = embodiment_tag
+        self.embodiment_id = _resolve_embodiment_id_from_tag(self.tag)
 
         self._metadata = self._get_metadata(EmbodimentTag(self.tag))
 
@@ -390,21 +428,29 @@ class LeRobotSingleDataset(Dataset):
         stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
         tmp_path = stats_path.with_suffix(".tmp")
         
-        # ---------- all rank try to read  ----------
-        if stats_path.exists():
-            try:
-                with open(stats_path, "r") as f:
-                    le_statistics = json.load(f)
-                for stat in le_statistics.values():
-                    DatasetStatisticalValues.model_validate(stat)
-            except Exception as e:
-                print(
-                    f"[RANK {os.environ.get('RANK', 'NA')}] "
-                    f"Failed to load dataset statistics ({e}), rebuilding..."
-                )
-                le_statistics = None
-        else:
+        # ---------- all rank try to read ----------
+        if self._force_recompute_stats:
             le_statistics = None
+            if is_main():
+                print(
+                    f"[RANK 0] Force recompute enabled, rebuilding dataset statistics for "
+                    f"{self.dataset_name} and overwriting {stats_path}"
+                )
+        else:
+            if stats_path.exists():
+                try:
+                    with open(stats_path, "r") as f:
+                        le_statistics = json.load(f)
+                    for stat in le_statistics.values():
+                        DatasetStatisticalValues.model_validate(stat)
+                except Exception as e:
+                    print(
+                        f"[RANK {os.environ.get('RANK', 'NA')}] "
+                        f"Failed to load dataset statistics ({e}), rebuilding..."
+                    )
+                    le_statistics = None
+            else:
+                le_statistics = None
         
         # ---------- rank0 build ----------
         if le_statistics is None and is_main():
@@ -501,7 +547,23 @@ class LeRobotSingleDataset(Dataset):
         """
         item = self.hf_dataset[abs_idx]
         trajectory_id = int(item["episode_index"])
-        row_idx = self._episode_index_to_row[trajectory_id]
+        try:
+            row_idx = self._episode_index_to_row[trajectory_id]
+        except KeyError as exc:
+            mapped_episode_ids = list(self._episode_index_to_row.keys())
+            mapped_min = min(mapped_episode_ids) if mapped_episode_ids else None
+            mapped_max = max(mapped_episode_ids) if mapped_episode_ids else None
+            raise KeyError(
+                "Episode index mapping mismatch detected. "
+                f"dataset_name={self.dataset_name}, dataset_path={self.dataset_path}, "
+                f"abs_idx={abs_idx}, episode_index_from_data={trajectory_id}, "
+                f"hf_dataset_len={len(self.hf_dataset)}, episodes_hf_len={len(self.episodes_hf)}, "
+                f"mapped_episode_count={len(mapped_episode_ids)}, "
+                f"mapped_episode_min={mapped_min}, mapped_episode_max={mapped_max}, "
+                f"mapped_episode_samples={mapped_episode_ids[:10]}. "
+                "This usually means `data/*.parquet` and `meta/episodes/*.parquet` are inconsistent "
+                "or loaded from different dataset versions."
+            ) from exc
         from_index = int(self.episodes_hf[row_idx]["dataset_from_index"])
         return trajectory_id, abs_idx - from_index
 
@@ -806,14 +868,17 @@ class LeRobotSingleDataset(Dataset):
         
         # Process all video keys dynamically
         images = []
+        videos = []
         for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            
-            # Apply image cropping if enabled and the video key is base_view
-            # Note: crop_obs_camera functionality has been removed
-            
-            image = Image.fromarray(image).resize((224, 224))
-            images.append(image)
+            view_frames = data[video_key]
+            if view_frames.ndim != 4:
+                raise ValueError(
+                    f"Expected video array shape [T, H, W, C] for key={video_key}, got {view_frames.shape}"
+                )
+
+            view_images = [preprocess_pil_image(Image.fromarray(frame)) for frame in view_frames]
+            images.append(view_images[0])
+            videos.append(view_images)
         
         # Get language and action data
         language = data[self.modality_keys["language"][0]][0]
@@ -822,7 +887,13 @@ class LeRobotSingleDataset(Dataset):
             action.append(data[action_key])
         action = np.concatenate(action, axis=1)
         
-        return dict(action=action, image=images, language=language)
+        return dict(
+            action=action,
+            image=images,
+            video=videos,
+            language=language,
+            embodiment_id=int(self.embodiment_id),
+        )
 
     def get_step_data(
         self,
@@ -1086,7 +1157,14 @@ class LeRobotSingleDataset(Dataset):
             np.ndarray: The video frames for the trajectory and frame indices. Shape: (T, H, W, C)
         """
         self._set_curr_episode(trajectory_id)
-        step_indices = np.asarray(self.delta_indices[key], dtype=np.int64) + int(base_index)
+        delta = np.asarray(self.delta_indices[key], dtype=np.int64).reshape(-1)
+        if delta.size == 0:
+            raise ValueError(f"Empty delta_indices for video key={key} in dataset={self.dataset_name}.")
+        # Wrist stream is consumed as a static image: decode only the chunk initial frame.
+        # This keeps wrist decoding independent from `num_frames`.
+        if "wrist" in key.lower():
+            delta = delta[:1]
+        step_indices = delta + int(base_index)
         step_indices = np.clip(step_indices, 0, self._curr_length - 1)
         assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
         key = key.replace("video.", "")
@@ -1115,14 +1193,14 @@ class LeRobotSingleDataset(Dataset):
         video_timestamp = rel_ts + from_ts
         # Build per-call kwargs so each dataset/video key uses its own fps parsed from info.json.
         backend_kwargs = dict(self.video_backend_kwargs)
-        if self.video_backend == "decord":
-            fps = None
-            if key in self.metadata.modalities.video:
-                fps = self.metadata.modalities.video[key].fps
-            elif original_key in self.metadata.modalities.video:
-                fps = self.metadata.modalities.video[original_key].fps
-            if fps is not None:
-                backend_kwargs["fixed_fps"] = float(fps)
+
+        fps = None
+        if key in self.metadata.modalities.video:
+            fps = self.metadata.modalities.video[key].fps
+        elif original_key in self.metadata.modalities.video:
+            fps = self.metadata.modalities.video[original_key].fps
+        if fps is not None:
+            backend_kwargs["fixed_fps"] = float(fps)
 
         return get_frames_by_timestamps(
             video_path.as_posix(),
@@ -1449,7 +1527,14 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         key: str,
         base_index: int,
     ) -> np.ndarray:
-        step_indices = self.delta_indices[key] + base_index
+        delta = np.asarray(self.delta_indices[key], dtype=np.int64).reshape(-1)
+        if delta.size == 0:
+            raise ValueError(f"Empty delta_indices for video key={key} in dataset={self.dataset_name}.")
+        # Wrist stream is consumed as a static image: decode only the chunk initial frame.
+        # This keeps wrist decoding independent from `num_frames`.
+        if "wrist" in key.lower():
+            delta = delta[:1]
+        step_indices = delta + int(base_index)
         # Get the trajectory index
         trajectory_index = self.get_trajectory_index(trajectory_id)
         # Ensure the indices are within the valid range
@@ -1658,6 +1743,7 @@ class LeRobotMixtureDataset(Dataset):
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
+        self.image_resolution = _resolve_image_resolution(self.data_cfg, default=256)
 
         # Set properties for sampling
 
@@ -1785,45 +1871,82 @@ class LeRobotMixtureDataset(Dataset):
                 raw_data = dataset.get_step_data(trajectory_id, step)    
                 data = dataset.transforms(raw_data)
                 
-                # Process all video keys dynamically
+                # Process all video keys dynamically:
+                # - Primary views: keep full video sequence for LAM + first frame for VLM.
+                # - Wrist views: keep first frame only (no wrist video sequence in current pipeline).
                 prim_images = []
-                wrist_views = []
+                wrist_images = []
+                prim_videos = []
                 for video_key in dataset.modality_keys["video"]:
-                    image = data[video_key][0]
-                    
-                    # Apply image cropping if enabled and the video key is base_view
-                    # Note: crop_obs_camera functionality has been removed
-                    image = Image.fromarray(image).resize((224, 224))
+                    view_frames = data[video_key]
+                    if view_frames.ndim != 4:
+                        raise ValueError(
+                            f"Expected video array shape [T, H, W, C] for key={video_key}, got {view_frames.shape}"
+                        )
                     if "wrist" not in video_key:
-                        prim_images.append(image)
+                        view_images = [
+                            preprocess_pil_image(Image.fromarray(frame))
+                            for frame in view_frames
+                        ]
+                        first_image = view_images[0]
+                        prim_images.append(first_image)
+                        prim_videos.append(view_images)
                     else:
-                        wrist_views.append(image)
-                all_images = prim_images + wrist_views
+                        # Wrist view is consumed as a single image only; avoid converting the full sequence.
+                        first_image = preprocess_pil_image(Image.fromarray(view_frames[0]))
+                        wrist_images.append(first_image)
+                all_images = prim_images + wrist_images
+                all_videos = prim_videos
                 
-                # Get language and action data
+                # Get language and state/action data from transform outputs
                 language = data[dataset.modality_keys["language"][0]][0]
-                action = []
-                for action_key in dataset.modality_keys["action"]:
-                    action.append(data[action_key])
-                action = np.concatenate(action, axis=1).astype(np.float16)
+                missing_action_keys = [key for key in ["action", "action_mask"] if key not in data]
+                if missing_action_keys:
+                    raise KeyError(
+                        f"Missing required transformed keys {missing_action_keys} for dataset "
+                        f"{dataset.dataset_name}. Ensure ConcatTransform is configured."
+                    )
+                action = data["action"]
+                action_mask = data["action_mask"]
 
-                state = []
-                for state_key in dataset.modality_keys["state"]:
-                    state.append(data[state_key])
-                state = np.concatenate(state, axis=1).astype(np.float16)
-                
-                state = None
-                
-                if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
-                    
-                    state = []
-                    for state_key in dataset.modality_keys["state"]:
-                        state.append(data[state_key])
-                    state = np.concatenate(state, axis=1).astype(np.float16)
-                    # prim_images
-                    return dict(action=action, image=all_images, lang=language, state=state)
+                include_state = (
+                    self.data_cfg is not None
+                    and self.data_cfg.get("include_state", False) not in ["False", False]
+                )
 
-                return dict(action=action, image=all_images, lang=language)
+                if include_state:
+                    missing_state_keys = [key for key in ["state", "state_mask"] if key not in data]
+                    if missing_state_keys:
+                        raise KeyError(
+                            f"Missing required transformed keys {missing_state_keys} for dataset "
+                            f"{dataset.dataset_name} with include_state=True. "
+                            "Ensure ConcatTransform is configured with state_concat_order."
+                        )
+                    return dict(
+                        action=action,
+                        action_mask=action_mask,
+                        image=all_images,
+                        video=all_videos,
+                        primary_images=prim_images,
+                        wrist_images=wrist_images,
+                        primary_videos=prim_videos,
+                        lang=language,
+                        state=data["state"],
+                        state_mask=data["state_mask"],
+                        embodiment_id=int(dataset.embodiment_id),
+                    )
+
+                return dict(
+                    action=action,
+                    action_mask=action_mask,
+                    image=all_images,
+                    video=all_videos,
+                    primary_images=prim_images,
+                    wrist_images=wrist_images,
+                    primary_videos=prim_videos,
+                    lang=language,
+                    embodiment_id=int(dataset.embodiment_id),
+                )
                 
             except Exception as e:
                 last_exception = e

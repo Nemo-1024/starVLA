@@ -21,8 +21,8 @@ import torch
 from pydantic import Field, PrivateAttr
 from transformers.data.data_collator import DataCollatorMixin
 
-from gr00t.data.schema import DatasetMetadata, EmbodimentTag
-from gr00t.data.transform.base import InvertibleModalityTransform
+from schema import DatasetMetadata, EmbodimentTag
+from base import InvertibleModalityTransform
 from gr00t.model.backbone.eagle2_hg_model.inference_eagle_repo import EagleProcessor
 
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."

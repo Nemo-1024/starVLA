@@ -67,6 +67,18 @@ def _parse_args() -> argparse.Namespace:
         help="Task description stored in tasks.parquet.",
     )
     parser.add_argument(
+        "--state_modality_name",
+        type=str,
+        default="xyz_rotation_6d_gripper",
+        help="State subkey name in modality.json, e.g. dummy_state.",
+    )
+    parser.add_argument(
+        "--action_modality_name",
+        type=str,
+        default="xyz_rotation_6d_gripper",
+        help="Action subkey name in modality.json, e.g. dummy_action.",
+    )
+    parser.add_argument(
         "--copy_mode",
         type=str,
         default="copy",
@@ -115,6 +127,24 @@ def _parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Remove output directory if it exists.",
+    )
+    parser.add_argument(
+        "--max_videos",
+        type=int,
+        default=None,
+        help="Optional cap on number of videos after sorting.",
+    )
+    parser.add_argument(
+        "--progress_every",
+        type=int,
+        default=100,
+        help="Print one progress line every N completed videos. Set <=0 to disable.",
+    )
+    parser.add_argument(
+        "--write_stats",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write meta/stats_gr00t.json after conversion.",
     )
     parser.add_argument(
         "--video_extensions",
@@ -340,13 +370,13 @@ def _place_video(
         dst.hardlink_to(src.resolve())
     else:
         raise ValueError(f"Unsupported copy mode: {mode}")
-    return _probe_video_cv2(dst, default_fps=30.0)[0]
+    return 0
 
 
-def _build_modality_json() -> dict:
+def _build_modality_json(state_modality_name: str, action_modality_name: str) -> dict:
     return {
         "state": {
-            "xyz_rotation_6d_gripper": {
+            state_modality_name: {
                 "start": 0,
                 "end": 10,
                 "absolute": True,
@@ -355,7 +385,7 @@ def _build_modality_json() -> dict:
             }
         },
         "action": {
-            "xyz_rotation_6d_gripper": {
+            action_modality_name: {
                 "start": 0,
                 "end": 10,
                 "absolute": True,
@@ -373,6 +403,120 @@ def _build_modality_json() -> dict:
                 "original_key": "task_index",
             }
         },
+    }
+
+
+def _scalar_stats(values: np.ndarray) -> dict:
+    values = values.astype(np.float64, copy=False)
+    if values.size == 0:
+        return {
+            "mean": [0.0],
+            "std": [0.0],
+            "min": [0.0],
+            "max": [0.0],
+            "q01": [0.0],
+            "q99": [0.0],
+        }
+    return {
+        "mean": [float(np.mean(values))],
+        "std": [float(np.std(values))],
+        "min": [float(np.min(values))],
+        "max": [float(np.max(values))],
+        "q01": [float(np.quantile(values, 0.01))],
+        "q99": [float(np.quantile(values, 0.99))],
+    }
+
+
+def _weighted_index_quantile(lengths: list[int], q: float) -> int:
+    total = int(sum(lengths))
+    if total <= 0:
+        return 0
+    rank = int(np.floor((total - 1) * q))
+    cumsum = np.cumsum(np.asarray(lengths, dtype=np.int64))
+    idx = int(np.searchsorted(cumsum, rank, side="right"))
+    if idx < 0:
+        return 0
+    if idx >= len(lengths):
+        return len(lengths) - 1
+    return idx
+
+
+def _build_stats_json(
+    episode_lengths: list[int],
+    episode_fps: list[float],
+) -> dict:
+    total_episodes = len(episode_lengths)
+    total_frames = int(sum(episode_lengths))
+
+    if total_frames > 0 and total_episodes > 0:
+        sum_i = 0.0
+        sum_i2 = 0.0
+        for idx, length in enumerate(episode_lengths):
+            l = float(max(length, 0))
+            sum_i += float(idx) * l
+            sum_i2 += float(idx * idx) * l
+        mean_i = sum_i / float(total_frames)
+        var_i = max(0.0, (sum_i2 / float(total_frames)) - mean_i * mean_i)
+        episode_index_stats = {
+            "mean": [float(mean_i)],
+            "std": [float(np.sqrt(var_i))],
+            "min": [0.0],
+            "max": [float(total_episodes - 1)],
+            "q01": [float(_weighted_index_quantile(episode_lengths, 0.01))],
+            "q99": [float(_weighted_index_quantile(episode_lengths, 0.99))],
+        }
+    else:
+        episode_index_stats = _scalar_stats(np.asarray([], dtype=np.float64))
+
+    if total_frames > 0:
+        sum_t = 0.0
+        sum_t2 = 0.0
+        max_t = 0.0
+        for length, fps in zip(episode_lengths, episode_fps, strict=True):
+            if length <= 0 or fps <= 0:
+                continue
+            l = float(length)
+            ff = float(fps)
+            sum_t += ((l - 1.0) * l) / (2.0 * ff)
+            sum_t2 += ((l - 1.0) * l * (2.0 * l - 1.0)) / (6.0 * ff * ff)
+            max_t = max(max_t, (l - 1.0) / ff)
+        mean_t = sum_t / float(total_frames)
+        var_t = max(0.0, (sum_t2 / float(total_frames)) - mean_t * mean_t)
+        timestamp_stats = {
+            "mean": [float(mean_t)],
+            "std": [float(np.sqrt(var_t))],
+            "min": [0.0],
+            "max": [float(max_t)],
+            "q01": [0.0],
+            "q99": [float(max_t)],
+        }
+    else:
+        timestamp_stats = _scalar_stats(np.asarray([], dtype=np.float64))
+
+    task_index_stats = {
+        "mean": [0.0],
+        "std": [0.0],
+        "min": [0.0],
+        "max": [0.0],
+        "q01": [0.0],
+        "q99": [0.0],
+    }
+    zero_vec = [0.0] * 10
+    zero_vec_stats = {
+        "mean": zero_vec,
+        "std": zero_vec,
+        "min": zero_vec,
+        "max": zero_vec,
+        "q01": zero_vec,
+        "q99": zero_vec,
+    }
+
+    return {
+        "episode_index": episode_index_stats,
+        "timestamp": timestamp_stats,
+        "task_index": task_index_stats,
+        STATE_KEY: zero_vec_stats,
+        ACTION_KEY: zero_vec_stats,
     }
 
 
@@ -431,6 +575,10 @@ def main() -> None:
     args = _parse_args()
     video_extensions = _parse_video_extensions(args.video_extensions)
     videos = _collect_videos(args.raw_video_dir, video_extensions)
+    if args.max_videos is not None:
+        if args.max_videos <= 0:
+            raise ValueError(f"--max_videos must be > 0, got {args.max_videos}")
+        videos = videos[: args.max_videos]
     _ensure_clean_output(args.output_dataset_dir, args.overwrite)
     print(
         f"Found {len(videos)} video files under {args.raw_video_dir} "
@@ -457,6 +605,8 @@ def main() -> None:
     first_fps = float(args.default_fps)
     first_codec = "h264"
     from_index = 0
+    episode_lengths: list[int] = []
+    episode_fps: list[float] = []
 
     video_iter = tqdm(
         enumerate(videos),
@@ -541,10 +691,15 @@ def main() -> None:
         )
         from_index = to_index
         total_frames += frame_count
-        video_iter.write(
-            f"[{episode_index + 1}/{len(videos)}] completed: {display_name} "
-            f"(frames={frame_count}, fps={fps:.3f})"
-        )
+        episode_lengths.append(frame_count)
+        episode_fps.append(float(fps))
+        if args.progress_every > 0 and (
+            (episode_index + 1) % args.progress_every == 0 or (episode_index + 1) == len(videos)
+        ):
+            video_iter.write(
+                f"[{episode_index + 1}/{len(videos)}] completed: {display_name} "
+                f"(frames={frame_count}, fps={fps:.3f})"
+            )
 
     episodes_df = pd.DataFrame(episodes_rows)
     episodes_df.to_parquet(
@@ -552,7 +707,10 @@ def main() -> None:
         index=False,
     )
 
-    modality_json = _build_modality_json()
+    modality_json = _build_modality_json(
+        state_modality_name=args.state_modality_name,
+        action_modality_name=args.action_modality_name,
+    )
     with open(args.output_dataset_dir / "meta" / "modality.json", "w", encoding="utf-8") as f:
         json.dump(modality_json, f, indent=2)
 
@@ -566,6 +724,13 @@ def main() -> None:
     )
     with open(args.output_dataset_dir / "meta" / "info.json", "w", encoding="utf-8") as f:
         json.dump(info_json, f, indent=2)
+    if args.write_stats:
+        stats_json = _build_stats_json(
+            episode_lengths=episode_lengths,
+            episode_fps=episode_fps,
+        )
+        with open(args.output_dataset_dir / "meta" / "stats_gr00t.json", "w", encoding="utf-8") as f:
+            json.dump(stats_json, f, indent=4)
 
     print(f"Built dataset at: {args.output_dataset_dir}")
     print(f"Episodes: {len(videos)}")

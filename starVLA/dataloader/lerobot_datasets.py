@@ -4,17 +4,37 @@
 # Modified by [Jinhui YE/ HKUST University] in [2025]. 
 # Modification: [suport topdowm processing, suport param from config].
 
+import copy
 from pathlib import Path
 from typing import Sequence
+
+import numpy as np
 from omegaconf import OmegaConf
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
 from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
 from starVLA.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
-from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG, EmbodimentTag
+from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG
 
 def collate_fn(batch):
     return batch
+
+
+def _sample_video_delta_indices(action_delta_indices: Sequence[int], num_frames: int) -> list[int]:
+    if num_frames < 1:
+        raise ValueError(f"`num_frames` must be >= 1, got {num_frames}.")
+    action_arr = np.asarray(action_delta_indices, dtype=np.int64).reshape(-1)
+    if action_arr.size == 0:
+        raise ValueError("`action_delta_indices` cannot be empty when building video sampling indices.")
+    if num_frames == 1:
+        return [int(action_arr[0])]
+
+    sampled_pos = np.rint(np.linspace(0, action_arr.size - 1, num=num_frames)).astype(np.int64)
+    sampled_pos = np.clip(sampled_pos, 0, action_arr.size - 1)
+    sampled_pos[0] = 0
+    sampled_pos[-1] = action_arr.size - 1
+    return action_arr[sampled_pos].astype(np.int64).tolist()
+
 
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
@@ -32,24 +52,46 @@ def make_LeRobotSingleDataset(
     :return: A LeRobotSingleDataset object.
     """
     
-    data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
+    if robot_type not in ROBOT_TYPE_CONFIG_MAP:
+        available_robot_types = sorted(ROBOT_TYPE_CONFIG_MAP.keys())
+        raise ValueError(
+            f"Unknown robot_type `{robot_type}`. "
+            f"Available robot types in ROBOT_TYPE_CONFIG_MAP: {available_robot_types}."
+        )
+    data_config = copy.deepcopy(ROBOT_TYPE_CONFIG_MAP[robot_type])
     modality_config = data_config.modality_config()
     transforms = data_config.transform()
     dataset_path = data_root_dir / data_name
     if robot_type not in ROBOT_TYPE_TO_EMBODIMENT_TAG:
-        print(f"Warning: Robot type {robot_type} not found in ROBOT_TYPE_TO_EMBODIMENT_TAG, using {EmbodimentTag.NEW_EMBODIMENT} as default")
-        embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
-    else:
-        embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
+        available_robot_types = sorted(ROBOT_TYPE_TO_EMBODIMENT_TAG.keys())
+        raise ValueError(
+            f"Unknown robot_type `{robot_type}`. "
+            f"Available robot types: {available_robot_types}."
+        )
+    embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
     
-    video_backend = data_cfg.get("video_backend", "decord") if data_cfg else "decord"
+    raw_num_frames = data_cfg.get("num_frames", 1) if data_cfg else 1
+    num_frames = int(raw_num_frames) if raw_num_frames is not None else 1
+    if "action" in modality_config and "video" in modality_config:
+        action_delta_indices = modality_config["action"].delta_indices
+        sampled_video_delta = _sample_video_delta_indices(
+            action_delta_indices=action_delta_indices,
+            num_frames=num_frames,
+        )
+        modality_config["video"].delta_indices = sampled_video_delta
+        print(
+            f"[LeRobotDataset] dataset={data_name} robot={robot_type} num_frames={num_frames} "
+            f"video_delta_indices={sampled_video_delta}"
+        )
+
+    video_backend = data_cfg.get("video_backend", "pyav") if data_cfg else "pyav"
     
     return LeRobotSingleDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
         transforms=transforms,
         embodiment_tag=embodiment_tag,
-        video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
+        video_backend=video_backend,
         data_cfg=data_cfg,
     )
 
@@ -96,13 +138,13 @@ if __name__ == "__main__":
     import debugpy
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_yaml", type=str, default="./starVLA/config/training/starvla_cotrain_behavior.yaml", help="Path to YAML config")
+    parser.add_argument("--config_yaml", type=str, default="./starVLA/config/training/starvla_train_oxe.yaml", help="Path to YAML config")
     args, clipargs = parser.parse_known_args()
 
     debugpy.listen(("0.0.0.0", 10092))
     print("🔍 Rank 0 waiting for debugger attach on port 10092...")
     debugpy.wait_for_client()
-    args.config_yaml = "./examples/MultiRobot/train_files/starvla_cotrain_multiRobot.yaml"
+    args.config_yaml = "./starVLA/config/training/starvla_train_oxe.yaml"
     cfg = OmegaConf.load(args.config_yaml)
     # cfg.datasets.vla_data.data_mix = "robotwin"
     vla_dataset_cfg = cfg.datasets.vla_data

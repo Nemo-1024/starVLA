@@ -10,7 +10,7 @@
 
 **[2025/12/25]**  We've released RoboCasa evaluation support, which trained **without pretraining and reach SOTA performance**. Check out more details in [examples/Robocasa_tabletop](examples/Robocasa_tabletop).
 
-**[2025/12/15]** Completed a release regression check to ensure the public code runs smoothly. Routine updates—including recent support for the LeRobot dataset v3.0 and DeepSpeed ZeRO-3—will continue to appear in the [🚧 Daily Development Log](https://github.com/starVLA/starVLA/issues/64#issue-3727060165).
+**[2025/12/15]** Completed a release regression check to ensure the public code runs smoothly. Routine updates—including recent support for the LeRobot dataset v3.0 and improved distributed training—will continue to appear in the [🚧 Daily Development Log](https://github.com/starVLA/starVLA/issues/64#issue-3727060165).
 
 **[2025/12/09]** Be the first open-source repository that can train with [train your vlm](starVLA/training/train_starvlm.py), [train your vla](starVLA/training/train_starvla.py), and [train your vla with vlm](starVLA/training/train_starvla_cotrain.py). Check out how to co-train your VLA with multimodal data in [examples/CoTrainVLM](examples/CoTrainVLM/README.md).
 
@@ -338,7 +338,7 @@ A: Yes. We use OmegaConf.load(args.config_yaml) as the single configuration entr
 Examples:
 ```bash
 accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml  \
+  --config_file starVLA/config/accelerate/ddp_bf16.yaml  \
   --num_processes 8 \
   starVLA/training/train_internvla.py \
   --config_yaml ./starVLA/config/training/starvla_cotrain_oxe.yaml \
@@ -396,7 +396,7 @@ Empty `reload_modules` means full load all model. However, starVLA does not save
 
 ```bash
     accelerate launch \
-      --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+      --config_file starVLA/config/accelerate/ddp_bf16.yaml \
       --main_process_ip $MASTER_ADDR \
       --main_process_port $MASTER_PORT \
       --machine_rank $SLURM_PROCID \
@@ -456,7 +456,6 @@ Tip: Before submitting a PR, run make check locally to pass formatting and lint.
 This project draws inspiration and references from several notable open-source initiatives, including:  
 - [LeRobot](https://github.com/huggingface/lerobot)  
 - [GR00T](https://github.com/NVIDIA/Isaac-GR00T/tree/main)  
-- [DeepSpeed](https://github.com/deepspeedai/DeepSpeed)  
 - [Qwen-VL](https://github.com/QwenLM/Qwen3-VL/tree/main)  
 - [InternVL](https://github.com/OpenGVLab/InternVL)  
 

@@ -149,7 +149,7 @@ class Qwenvl_OFT(baseframework):
             # 计算 L1 损失
             action_loss = self.l1_loss(pred_actions, actions_target)
 
-        return {"action_loss": action_loss}
+        return {"total_loss": action_loss}
 
     @torch.inference_mode()
     def predict_action(
@@ -263,7 +263,7 @@ if __name__ == "__main__":
     import debugpy
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_yaml", type=str, default="./starVLA/config/training/starvla_cotrain_oxe.yaml", help="Path to YAML config")
+    parser.add_argument("--config_yaml", type=str, default="./starVLA/config/training/starvla_train_oxe.yaml", help="Path to YAML config")
     args, clipargs = parser.parse_known_args()
 
     debugpy.listen(("0.0.0.0", 10092))
@@ -301,8 +301,8 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     forward_output = model(batch)
-    action_loss = forward_output['action_loss']
-    print(f"Action Loss: {action_loss.item()}")
+    total_loss = forward_output['total_loss']
+    print(f"Total Loss: {total_loss.item()}")
 
     # test predict action
     predict_output = model.predict_action(batch_images=[batch[0]["image"]], instructions=[batch[0]["lang"]])

@@ -33,7 +33,7 @@ mkdir -p ${output_dir}
 cp $0 ${output_dir}/
 
 accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --config_file starVLA/config/accelerate/ddp_bf16.yaml \
   --num_processes 8 \
   starVLA/training/train_starvla.py \
   --config_yaml ${config_yaml} \
@@ -58,7 +58,7 @@ accelerate launch \
 
 ##### Multi-Server Multi-GPU training script #####
   # accelerate launch \
-  #   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  #   --config_file starVLA/config/accelerate/ddp_bf16.yaml \
   #   --main_process_ip $MASTER_ADDR \
   #   --main_process_port $MASTER_PORT \
   #   --machine_rank $SLURM_PROCID \

@@ -4,7 +4,7 @@
 
 
 """
-StarVLA’s trainer is built directly on native PyTorch + Accelerate + DeepSpeed, keeping the loop explicit and easy to hack.
+StarVLA’s trainer is built directly on native PyTorch + Accelerate DDP, keeping the loop explicit and easy to hack.
 Conventions:
 1. Store runtime state in dicts where possible (simplifies data info, procesing info, config, etc).  
 2. Use multiple dataloaders to adapt heterogeneous data types / task mixtures.  
@@ -27,9 +27,9 @@ import torch
 import torch.distributed as dist
 import wandb
 import yaml
-from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
@@ -41,23 +41,32 @@ from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 from starVLA.training.trainer_utils.config_tracker import wrap_config, AccessTrackedConfig
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
-from accelerate.logging import get_logger
-
 logger = get_logger(__name__)
 
 
 def load_fast_tokenizer():
     fast_tokenizer = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
     return fast_tokenizer
+
+
+def build_accelerator(cfg) -> Accelerator:
+    """build accelerator in DDP mode"""
+    trainer_cfg = getattr(cfg, "trainer", None)
+    gradient_accumulation_steps = int(getattr(trainer_cfg, "gradient_accumulation_steps", 1))
+    ddp_find_unused_parameters = bool(getattr(trainer_cfg, "ddp_find_unused_parameters", True))
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=ddp_find_unused_parameters)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        kwargs_handlers=[ddp_kwargs],
+    )
+    accelerator.print(accelerator.state)
+    return accelerator
 
 
 def setup_directories(cfg) -> Path:
@@ -97,8 +106,10 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
-    accelerator.dataloader_config.dispatch_batches = False
-    dist.barrier()
+    if accelerator.dataloader_config is not None:
+        accelerator.dataloader_config.dispatch_batches = False
+    if dist.is_initialized():
+        dist.barrier()
 
     return vla_train_dataloader
 
@@ -144,6 +155,8 @@ class VLATrainer(TrainerUtils):
         # training status tracking
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        trackers = list(getattr(self.config, "trackers", [])) if hasattr(self.config, "trackers") else []
+        self.use_wandb = "wandb" in trackers if trackers else True
     
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -203,14 +216,23 @@ class VLATrainer(TrainerUtils):
 
     def _init_wandb(self):
         """initialize Weights & Biases"""
+        if not self.use_wandb:
+            return
         if self.accelerator.is_main_process:
-            wandb.init(
-                name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
-                group="vla-train",
-            )
+            try:
+                # Force offline logging whenever wandb is enabled.
+                os.environ["WANDB_MODE"] = "offline"
+                wandb.init(
+                    name=self.config.run_id,
+                    dir=os.path.join(self.config.output_dir, "wandb"),
+                    project=self.config.wandb_project,
+                    entity=self.config.wandb_entity,
+                    group="vla-train",
+                    mode="offline",
+                )
+            except Exception as e:
+                self.use_wandb = False
+                logger.warning(f"W&B init failed, disable wandb logging for this run: {e}")
 
     def _init_checkpointing(self):
         """Initialize checkpoint directory and handle checkpoint loading."""
@@ -292,7 +314,7 @@ class VLATrainer(TrainerUtils):
     def _log_metrics(self, metrics):
         """record training metrics"""
         if self.completed_steps % self.config.trainer.logging_frequency == 0:
-            if dist.get_rank() == 0:
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
                 # add learning rate 
                 metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0] # see lr group in yaml.trainer.learning_rate
 
@@ -300,14 +322,14 @@ class VLATrainer(TrainerUtils):
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                wandb.log(metrics, step=self.completed_steps)
+                if self.use_wandb:
+                    wandb.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
     def _create_data_iterators(self):
         """create data iterators"""
         self.vla_iter = iter(self.vla_train_dataloader)
-        # self.vlm_iter = iter(self.vlm_train_dataloader)
 
     def _get_next_batch(self):
         """get next batch (automatically handle data loop)"""
@@ -412,7 +434,8 @@ class VLATrainer(TrainerUtils):
             step_metrics["mse_score"] = average_score
 
         del examples
-        dist.barrier()  # ensure all processes are synchronized
+        if dist.is_initialized():
+            dist.barrier()  # ensure all processes are synchronized
         return step_metrics
 
     def _log_training_config(self):
@@ -421,20 +444,19 @@ class VLATrainer(TrainerUtils):
             logger.info("***** Training Configuration *****")
             logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
             logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
-            logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
+            logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
 
-    def _train_step(self, batch_vla, batch_vlm=None):
+    def _train_step(self, batch_vla):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 
             # VLA task forward propagation
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
-
-                action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+            output_dict = self.model.forward(batch_vla)
+            if "total_loss" not in output_dict:
+                raise KeyError("Model forward must return `total_loss`.")
+            total_loss = output_dict["total_loss"]
 
             # VLA backward propagation
             self.accelerator.backward(total_loss)
@@ -447,9 +469,18 @@ class VLATrainer(TrainerUtils):
             self.optimizer.step()
             self.lr_scheduler.step()
 
-        return {
-            "action_dit_loss": action_loss.item(),
+        metrics = {"train_loss": float(total_loss.detach().item())}
+        # Optional component losses with stable logging keys.
+        component_key_map = {
+            "total_loss": "train_loss_total",
+            "loss_flow": "train_loss_flow",
+            "loss_perceptual": "train_loss_perceptual",
+            "loss_distill": "train_loss_distill",
         }
+        for raw_key, log_key in component_key_map.items():
+            if raw_key in output_dict and torch.is_tensor(output_dict[raw_key]):
+                metrics[log_key] = float(output_dict[raw_key].detach().item())
+        return metrics
 
     def _finalize_training(self):
         """training end processing"""
@@ -463,7 +494,7 @@ class VLATrainer(TrainerUtils):
 
 
         # close W&B
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and self.use_wandb:
             wandb.finish()
 
         self.accelerator.wait_for_everyone()
@@ -475,6 +506,7 @@ def main(cfg) -> None:
     #  Wrap config to enable access tracking
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
+    accelerator = build_accelerator(cfg)
 
     # create output directory and save config
     output_dir = setup_directories(cfg=cfg)
@@ -504,13 +536,14 @@ def main(cfg) -> None:
 
     # And... we're done!
     logger.info("... and that's all, folks!")
-    dist.barrier()
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_yaml", type=str, default="starVLA/config/training/starvla_cotrain_oxe.yaml", help="Path to YAML config")
+    parser.add_argument("--config_yaml", type=str, default="starVLA/config/training/starvla_train_oxe.yaml", help="Path to YAML config")
     args, clipargs = parser.parse_known_args()
 
     # Load YAML config & Convert CLI overrides to dotlist config

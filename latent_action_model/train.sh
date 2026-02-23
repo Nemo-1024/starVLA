@@ -1,5 +1,6 @@
 REPO_ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 export PYTHONPATH="${PYTHONPATH}:${REPO_ROOT_DIR}"
+cd "${REPO_ROOT_DIR}" || exit 1
 
 # Hugging Face 缓存目录（数据集、模型等），放在 REPO_ROOT_DIR 的祖父目录下
 HF_CACHE_BASE="$(dirname "$(dirname "${REPO_ROOT_DIR}")")/.hf_cache"
@@ -8,9 +9,8 @@ export HF_DATASETS_CACHE="${HF_CACHE_BASE}/datasets"
 export HUGGINGFACE_HUB_CACHE="${HF_CACHE_BASE}/hub"
 
 # NOTE:
-# torchrun 会启动多个训练进程；每个进程还会再启动 DataLoader workers。
-# 如果这里把 OMP 线程数设得过大，很容易出现 CPU 过度订阅（表现为吞吐抖动/间歇性卡顿、进度条跳步）。
-# 因此默认将各类 BLAS/OMP 线程限制为 1；如需手动调优，可在外部先 export 覆盖。
+# 主进程（各 GPU 训练进程）限制为单线程，把 CPU 留给 DataLoader workers，避免过度订阅导致卡顿。
+# DataLoader worker 内线程数由 lerobot_datamodule 的 worker_init_fn 控制（默认 1；可设 LAM_WORKER_OMP_THREADS=2 进一步压榨）。
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -20,12 +20,15 @@ export BLIS_NUM_THREADS=1
 export TORCH_NUM_THREADS=1
 export TORCH_INTRAOP_THREADS=1
 export TORCH_INTEROP_THREADS=1
+# OpenMP: 不等待，尽快让出 CPU 给其他线程/进程（利于多 worker 数据加载）
 export KMP_BLOCKTIME=0
+# 可选：为 worker 内解码留更多线程（默认不设=1）；若 CPU 仍有大量 idle 可试 export LAM_WORKER_OMP_THREADS=2
+# export LAM_WORKER_OMP_THREADS=2
 export TF_CPP_MIN_LOG_LEVEL=3
 export WANDB_DISABLE_STATS=true
 export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_TIMEOUT=1800   # 单位：秒
+export TORCH_NCCL_TIMEOUT=720000  # 单位：秒
 
 
 
@@ -35,7 +38,7 @@ export TORCH_NCCL_TIMEOUT=1800   # 单位：秒
 # 默认配置文件（当未在命令行通过 --config 指定时使用）
 DEFAULT_CONFIG_FILE="${REPO_ROOT_DIR}/latent_action_model/config/dino_base_ae.yaml"
 TIMESTAMP="$(date +%m%d_%H%M%S)"
-LOG_DIR="latent_action_model/logs/train_logs/${TIMESTAMP}"
+LOG_DIR="${REPO_ROOT_DIR}/latent_action_model/logs/train_logs/${TIMESTAMP}"
 
 LOG_FILE="${LOG_DIR}/train_logs.log"
 
@@ -105,26 +108,27 @@ else
     export LAM_TRAIN_LOG_FILE="${REPO_ROOT_DIR}/${LOG_FILE}"
 fi
 
-# 仅在用户通过 --config 指定配置时，备份该用户配置到日志目录
-if [[ "${HAS_USER_CONFIG}" == true ]]; then
-    if [[ -n "${USER_CONFIG_FILE}" && -f "${USER_CONFIG_FILE}" ]]; then
-        cp "${USER_CONFIG_FILE}" "${LOG_DIR}/$(basename "${USER_CONFIG_FILE}")"
+# 解析本次训练实际使用的配置文件路径（无论默认还是用户 --config）
+SOURCE_CONFIG_FILE="${DEFAULT_CONFIG_FILE}"
+if [[ "${HAS_USER_CONFIG}" == true && -n "${USER_CONFIG_FILE}" ]]; then
+    SOURCE_CONFIG_FILE="${USER_CONFIG_FILE}"
+fi
+
+if [[ "${SOURCE_CONFIG_FILE}" = /* ]]; then
+    export LAM_CONFIG_PATH="${SOURCE_CONFIG_FILE}"
+else
+    if command -v realpath &> /dev/null; then
+        export LAM_CONFIG_PATH="$(realpath -m "${SOURCE_CONFIG_FILE}")"
     else
-        echo "⚠️ 用户配置文件未找到或未提供: ${USER_CONFIG_FILE}" >&2
+        export LAM_CONFIG_PATH="${REPO_ROOT_DIR}/${SOURCE_CONFIG_FILE}"
     fi
 fi
 
-# 若指定了用户配置，将其绝对路径导出为环境变量，供回调保存使用
-if [[ "${HAS_USER_CONFIG}" == true && -n "${USER_CONFIG_FILE}" ]]; then
-    if [[ "${USER_CONFIG_FILE}" = /* ]]; then
-        export LAM_CONFIG_PATH="${USER_CONFIG_FILE}"
-    else
-        if command -v realpath &> /dev/null; then
-            export LAM_CONFIG_PATH="$(realpath -m "${USER_CONFIG_FILE}")"
-        else
-            export LAM_CONFIG_PATH="${REPO_ROOT_DIR}/${USER_CONFIG_FILE}"
-        fi
-    fi
+# 备份实际配置到外部训练日志目录，便于从 train_logs 目录直接回溯参数
+if [[ -f "${LAM_CONFIG_PATH}" ]]; then
+    cp "${LAM_CONFIG_PATH}" "${LOG_DIR}/$(basename "${LAM_CONFIG_PATH}")"
+else
+    echo "⚠️ 配置文件未找到: ${LAM_CONFIG_PATH}" >&2
 fi
 
 # 自动获取 GPU 数量

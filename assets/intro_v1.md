@@ -49,7 +49,7 @@ Conventions:
 <details close>
 <summary><b>4. Trainer: Lightweight & Strategy-Oriented</b></summary>
 
-StarVLA’s trainer is built directly on native PyTorch + Accelerate + DeepSpeed, keeping the loop explicit and easy to hack.
+StarVLA’s trainer is built directly on native PyTorch + Accelerate DDP, keeping the loop explicit and easy to hack.
 
 Conventions:
 1. Store runtime state in dicts where possible (simplifies data info, procesing info, config, etc).  

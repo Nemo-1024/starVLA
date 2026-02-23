@@ -278,7 +278,7 @@ class Qwen_Adapter(baseframework):
 
         loss = torch.nn.L1Loss()(predicted_actions, gt_actions)
 
-        return {"action_loss": loss}
+        return {"total_loss": loss}
 
     @torch.inference_mode()
     def predict_action(
@@ -490,8 +490,8 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     forward_output = model(batch)
-    action_loss = forward_output['action_loss']
-    print(f"Action Loss: {action_loss.item()}")
+    total_loss = forward_output['total_loss']
+    print(f"Total Loss: {total_loss.item()}")
 
     # test predict action
     predict_output = model.predict_action(examples=[batch[0]])

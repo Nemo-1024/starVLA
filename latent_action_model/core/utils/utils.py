@@ -44,68 +44,92 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
 
 def eef_reconstruction_loss(
     s_pred: torch.Tensor,
-    state_delta: Optional[torch.Tensor] = None,
-    pos_loss_type: str = "l1",
+    state_delta: torch.Tensor,
+    state_mask: torch.Tensor,
+    state_loss_type: str = "l1",
     reduction: str = "mean",
 ) -> torch.Tensor:
-    """
-    只使用预先计算的 state_delta 作为监督信号。
-    state 仅用于接口兼容，不参与计算。
-    """
-    if len(s_pred.shape) == 2:
-        s_pred = s_pred.unsqueeze(1)
-
     if state_delta is None:
-        raise ValueError("eef_reconstruction_loss 需要提供 state_delta 作为监督信号。")
+        raise ValueError("eef_reconstruction_loss requires `state_delta`.")
+    if state_mask is None:
+        raise ValueError("eef_reconstruction_loss requires `state_mask`.")
 
-    num_steps = s_pred.shape[-2]
+    pred_was_2d = s_pred.dim() == 2
+    if s_pred.dim() == 2:
+        s_pred = s_pred.unsqueeze(1)
+    elif s_pred.dim() != 3:
+        raise ValueError(f"s_pred must be [B,D] or [B,T,D], got {tuple(s_pred.shape)}")
+
     delta = state_delta
     if not torch.is_tensor(delta):
         delta = torch.as_tensor(delta, device=s_pred.device, dtype=s_pred.dtype)
-    if delta.dim() == s_pred.dim() - 1:
-        delta = delta.unsqueeze(-2)
-    if delta.shape[-2] == 1 and num_steps > 1:
-        delta = delta.expand(*s_pred.shape[:-2], num_steps, delta.shape[-1])
+    else:
+        delta = delta.to(device=s_pred.device, dtype=s_pred.dtype)
+    if delta.dim() == 2:
+        delta = delta.unsqueeze(1)
+    elif delta.dim() != 3:
+        raise ValueError(f"state_delta must be [B,D] or [B,T,D], got {tuple(delta.shape)}")
 
-    if delta.shape[-1] != s_pred.shape[-1]:
+    mask = state_mask
+    if not torch.is_tensor(mask):
+        mask = torch.as_tensor(mask, device=s_pred.device)
+    else:
+        mask = mask.to(device=s_pred.device)
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(1)
+    elif mask.dim() != 3:
+        raise ValueError(f"state_mask must be [B,D] or [B,T,D], got {tuple(mask.shape)}")
+
+    pred_t = int(s_pred.shape[1])
+    if delta.shape[1] == 1 and pred_t > 1:
+        delta = delta.expand(-1, pred_t, -1)
+    elif delta.shape[1] != pred_t:
         raise ValueError(
-            f"state_delta 末尾维度与预测不匹配: delta={delta.shape[-1]}, pred={s_pred.shape[-1]}"
+            f"state_delta time dim mismatch: got {delta.shape[1]}, expected 1 or {pred_t}."
         )
 
-    gripper_dim = max(1, s_pred.shape[-1] - 7) if s_pred.shape[-1] > 7 else 1
-    pos_ori_target = delta[..., :-gripper_dim]
-    gripper_target = delta[..., -gripper_dim:]
+    if mask.shape[1] == 1 and pred_t > 1:
+        mask = mask.expand(-1, pred_t, -1)
+    elif mask.shape[1] != pred_t:
+        raise ValueError(
+            f"state_mask time dim mismatch: got {mask.shape[1]}, expected 1 or {pred_t}."
+        )
 
-    pos_ori_pred = s_pred[..., :-gripper_dim]
-    gripper_pred = s_pred[..., -gripper_dim:]
+    if delta.shape[0] != s_pred.shape[0] or delta.shape[2] != s_pred.shape[2]:
+        raise ValueError(
+            f"state_delta shape mismatch: delta={tuple(delta.shape)} vs pred={tuple(s_pred.shape)}"
+        )
+    if mask.shape[0] != s_pred.shape[0] or mask.shape[2] != s_pred.shape[2]:
+        raise ValueError(
+            f"state_mask shape mismatch: mask={tuple(mask.shape)} vs pred={tuple(s_pred.shape)}"
+        )
 
-    if pos_loss_type == "l1":
-        pos_ori_loss = torch.abs(pos_ori_pred - pos_ori_target)
-    elif pos_loss_type == "l2":
-        pos_ori_loss = (pos_ori_pred - pos_ori_target) ** 2
+    if state_loss_type == "l1":
+        raw_loss = torch.abs(s_pred - delta)
+    elif state_loss_type == "l2":
+        raw_loss = (s_pred - delta) ** 2
     else:
-        raise ValueError(f"Unsupported pos_loss_type: {pos_loss_type}")
+        raise ValueError(f"Unsupported state_loss_type: {state_loss_type}")
 
-    # 抓手默认回归（保持与传入 delta 对齐）
-    gripper_loss = torch.abs(gripper_pred - gripper_target)
-
-    total_loss = pos_ori_loss.mean(dim=-1) + 0.1 * gripper_loss.mean(dim=-1)
+    mask_f = mask.to(dtype=raw_loss.dtype)
+    masked_loss = raw_loss * mask_f
 
     if reduction == "mean":
-        total_loss = total_loss.mean()
+        valid_count = mask_f.sum().clamp_min(1.0)
+        out = masked_loss.sum() / valid_count
     elif reduction == "sum":
-        total_loss = total_loss.sum()
+        out = masked_loss.sum()
     elif reduction == "none":
-        pass
+        out = masked_loss
+        if pred_was_2d:
+            out = out.squeeze(1)
     else:
         raise ValueError(f"Unsupported reduction: {reduction}")
 
-    return total_loss
+    return out
 
 # Charbonnier loss 定义（避免外部依赖缺失）
 def charbonnier_loss(input: torch.Tensor, target: torch.Tensor, eps: float = 0.1) -> torch.Tensor:
     diff = input - target
     return torch.mean(torch.sqrt(diff * diff + eps * eps))
-
-
 

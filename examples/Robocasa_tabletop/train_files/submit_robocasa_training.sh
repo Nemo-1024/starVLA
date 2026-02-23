@@ -50,7 +50,7 @@ export base_vlm=./playground/Pretrained_models/Qwen3-VL-4B-Instruct-Action
 export freeze_module_list=""
 export action_input_dim=2560
 export DIT_TYPE="DiT-B"
-export config_yaml=./examples/Robocasa_tabletop/train_files/starvla_cotrain_robocasa_gr1.yaml
+export config_yaml=./examples/Robocasa_tabletop/train_files/starvla_train_robocasa_gr1.yaml
 export data_mix=fourier_gr1_unified_1000
 export include_state=True
 export run_root_dir=./results/Checkpoints
@@ -76,7 +76,7 @@ cp $0 ${output_dir}/
   # --datasets.vla_data.include_state ${include_state} \
 
 srun --jobid $SLURM_JOBID bash -c 'accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --config_file starVLA/config/accelerate/ddp_bf16.yaml \
   --main_process_ip $MASTER_ADDR \
   --main_process_port $MASTER_PORT \
   --machine_rank $SLURM_PROCID \

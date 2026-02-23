@@ -37,6 +37,32 @@ def _normalize_state_keys(
     return state_keys
 
 
+def filter_lam_video_keys(
+    base_video_keys: Sequence[str],
+    preferred_video_key: str | None = None,
+) -> list[str]:
+    """
+    Keep only one non-wrist camera key for LAM to avoid decoding unused multi-view streams.
+    """
+    filtered_video_keys = [key for key in base_video_keys if "wrist" not in key.lower()]
+    if not filtered_video_keys:
+        raise ValueError(
+            "No non-wrist video keys available for LAM. "
+            f"Received keys: {list(base_video_keys)}"
+        )
+
+    if preferred_video_key is not None:
+        if preferred_video_key in filtered_video_keys:
+            return [preferred_video_key]
+        if preferred_video_key in base_video_keys:
+            raise ValueError(
+                f"Preferred video key '{preferred_video_key}' is filtered out because it is a wrist view. "
+                f"Available non-wrist keys: {filtered_video_keys}"
+            )
+
+    return [filtered_video_keys[0]]
+
+
 def build_lam_state_normalize_transform(
     robot_type: str,
     state_keys: Sequence[str] | None = None,
