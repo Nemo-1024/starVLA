@@ -23,8 +23,8 @@ class VAEQuantizer(nn.Module):
 
     def __init__(
         self,
-        code_dim: int = 128,
-        beta: float = 1.0,
+        code_dim: int = 64,
+        beta: float = 5e-5,
         clamp_logvar: Optional[float] = 10.0,
         layer_norm: bool = False,
         *args,
@@ -80,7 +80,7 @@ class VAEQuantizer(nn.Module):
         indices = None
         entropy_loss = nodes.new_tensor(0.0)
         vq_loss = kl_loss * self.beta
-        return quantized, perplexity, indices, entropy_loss, vq_loss, mu, logvar
+        return quantized, perplexity, indices, entropy_loss, vq_loss
 
     @torch.no_grad()
     def inference(

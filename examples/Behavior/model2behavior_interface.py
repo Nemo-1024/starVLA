@@ -38,8 +38,7 @@ class M1Inference:
         image_size: list[int] = [224, 224],
         action_scale: float = 1.0,
         cfg_scale: float = 1.5,
-        use_ddim: bool = True,
-        num_ddim_steps: int = 10,
+        num_inference_steps: int = 10,
         action_ensemble: bool = False,
         adaptive_ensemble_alpha: float = 0.1,
         host: str = "0.0.0.0",
@@ -74,8 +73,7 @@ class M1Inference:
         self.policy_ckpt_path = policy_ckpt_path
 
         print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
-        self.use_ddim = use_ddim
-        self.num_ddim_steps = num_ddim_steps
+        self.num_inference_steps = num_inference_steps
         self.cfg_scale = cfg_scale
         self.image_size = image_size
         self.action_scale = action_scale

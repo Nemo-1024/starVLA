@@ -47,7 +47,6 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/OXE_LEROBOT_DATASET
     data_mix: bridge_rt_1 # bridge_rt_1
     action_type: delta_ee

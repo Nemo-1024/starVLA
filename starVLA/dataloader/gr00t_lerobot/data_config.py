@@ -525,8 +525,8 @@ class Libero4in1DataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.eef_position": "q99",
-                    "state.eef_orientation": "q99",
+                    "state.eef_position": "min_max",
+                    "state.eef_orientation": "min_max",
                     "state.gripper": "binary",
                 },
             ),
@@ -535,8 +535,8 @@ class Libero4in1DataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.eef_position": "q99",
-                    "action.eef_orientation": "q99",
+                    "action.eef_position": "min_max",
+                    "action.eef_orientation": "min_max",
                     "action.gripper": "binary",
                 },
             ),

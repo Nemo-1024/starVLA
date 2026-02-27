@@ -26,13 +26,20 @@ def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
     v = float(arr[0])
     bin_val = 1.0 - 2.0 * (v > 0.5)
     return np.asarray([bin_val], dtype=np.float32)
-
+def invert_gripper_action(action):
+    """
+    Flips the sign of the gripper action (last dimension of action vector).
+    This is necessary for some environments where -1 = open, +1 = close, since
+    the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open.
+    """
+    action[..., -1] = action[..., -1] * -1.0
+    return action
 
 @dataclasses.dataclass
 class Args:
     host: str = "127.0.0.1"
     port: int = 10093
-    resize_size = [224,224]
+    resize_size = [256,256]
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -148,7 +155,7 @@ def eval_libero(args: Args) -> None:
                     (
                         obs["robot0_eef_pos"],
                         _quat2axisangle(obs["robot0_eef_quat"]),
-                        obs["robot0_gripper_qpos"],
+                        np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32).reshape(-1)[-1:],
                     )
                 )
 
@@ -166,7 +173,9 @@ def eval_libero(args: Args) -> None:
                 # align key with model API --> 这里给了两个图像 --> check training
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
+                    "wrist_images": [observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
+                    "state": observation["observation.state"].astype(np.float32, copy=False),
                 }
 
                 
@@ -184,7 +193,7 @@ def eval_libero(args: Args) -> None:
                 rotation_delta = np.asarray(raw_action.get("rotation_delta"), dtype=np.float32).reshape(-1)
                 open_gripper = np.asarray(raw_action.get("open_gripper"), dtype=np.float32).reshape(-1)
                 gripper = _binarize_gripper_open(open_gripper)
-
+                # gripper = invert_gripper_action(gripper)
                 if not (world_vector_delta.size == 3 and rotation_delta.size == 3 and open_gripper.size == 1):
                     logging.warning(f"Unexpected action sizes: "
                                     f"wv={world_vector_delta.shape}, rot={rotation_delta.shape}, grip={gripper.shape}. "

@@ -1,5 +1,6 @@
 from typing import Dict, Tuple, Optional, Callable, Iterable, Any, List
 from pathlib import Path
+from collections import Counter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -59,6 +60,7 @@ class VJEPA_LAM(LightningModule):
         wandb_offline: bool = False,
         optimizer: OptimizerCallable = torch.optim.AdamW,
         weight_decay: float = 0.01,
+        exclude_bias_norm_from_wd: bool = False,
         # 索引保存参数
         make_data_pair: bool = False,
         output_dir: str = "output_pairs",
@@ -78,6 +80,7 @@ class VJEPA_LAM(LightningModule):
         image_hw: Tuple[int, int] = LAM_IMAGE_HW,
         patch_size: int = LAM_PATCH_SIZE,
         image_aug: bool = True,
+        dual_view_aug: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -89,6 +92,7 @@ class VJEPA_LAM(LightningModule):
         self.image_hw = (int(image_hw[0]), int(image_hw[1]))
         self.patch_size = int(patch_size)
         self.image_aug = image_aug
+        self.dual_view_aug = bool(dual_view_aug)
         if self.image_hw != LAM_IMAGE_HW:
             raise ValueError(
                 f"Unsupported LAM image_hw={self.image_hw}. "
@@ -133,6 +137,7 @@ class VJEPA_LAM(LightningModule):
         # 训练参数
         self.optimizer = optimizer
         self.weight_decay = weight_decay
+        self.exclude_bias_norm_from_wd = bool(exclude_bias_norm_from_wd)
         self.codebook_size = codebook_size
         self.warmup_steps = int(warmup_steps)
         
@@ -153,6 +158,299 @@ class VJEPA_LAM(LightningModule):
         self.state_loss_type = state_loss_type
         # Run expensive unused-params scan only once at training start.
         self._unused_params_scanned = False
+        self._optimizer_group_summary_printed = False
+        try:
+            self._spike_loss_threshold = float(os.environ.get("LAM_SPIKE_LOSS_THRESHOLD", "1.0"))
+        except ValueError:
+            self._spike_loss_threshold = 1.0
+        try:
+            self._spike_arm_loss_threshold = float(os.environ.get("LAM_SPIKE_ARM_LOSS_THRESHOLD", "0.2"))
+        except ValueError:
+            self._spike_arm_loss_threshold = 0.2
+        try:
+            self._spike_log_cooldown = max(1, int(os.environ.get("LAM_SPIKE_LOG_COOLDOWN", "200")))
+        except ValueError:
+            self._spike_log_cooldown = 200
+        try:
+            self._spike_log_max_logs = max(1, int(os.environ.get("LAM_SPIKE_MAX_LOGS", "50")))
+        except ValueError:
+            self._spike_log_max_logs = 50
+        self._spike_log_count = 0
+        self._last_spike_log_step = -10**12
+        self._spike_armed = False
+        self._spike_arm_step: Optional[int] = None
+        self._last_step_tensors: Dict[str, Tensor] = {}
+
+    def _get_current_lr(self) -> Optional[float]:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        optimizers = getattr(trainer, "optimizers", None)
+        if not optimizers:
+            return None
+        param_groups = getattr(optimizers[0], "param_groups", None)
+        if not param_groups:
+            return None
+        lr = param_groups[0].get("lr", None)
+        return float(lr) if lr is not None else None
+
+    @staticmethod
+    def _to_float(v: Any, default: float = 0.0) -> float:
+        if isinstance(v, torch.Tensor):
+            return float(v.detach().float().item())
+        if v is None:
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_quantile_1d(
+        values: Tensor,
+        quantiles: tuple[float, ...] = (0.5, 0.9, 0.99),
+        max_elems: int = 200_000,
+    ) -> Tensor:
+        """Compute quantiles on at most `max_elems` values to avoid backend size limits."""
+        if values.ndim != 1:
+            values = values.reshape(-1)
+        if values.numel() == 0:
+            return torch.full((len(quantiles),), float("nan"), device=values.device, dtype=values.dtype)
+
+        sampled = values
+        if sampled.numel() > max_elems:
+            step = max(1, sampled.numel() // max_elems)
+            sampled = sampled[::step]
+            if sampled.numel() > max_elems:
+                sampled = sampled[:max_elems]
+
+        q = torch.tensor(quantiles, device=sampled.device, dtype=sampled.dtype)
+        try:
+            return torch.quantile(sampled, q)
+        except RuntimeError:
+            # Fallback for rare backend-specific quantile limitations.
+            sampled_cpu = sampled.cpu()
+            q_cpu = q.cpu()
+            result_cpu = torch.quantile(sampled_cpu, q_cpu)
+            return result_cpu.to(values.device)
+
+    @staticmethod
+    def _summarize_spike_tensor(name: str, tensor: Optional[Tensor]) -> str:
+        """Summarize tensor scale with norm/value quantiles for spike debugging."""
+        if tensor is None:
+            return f"{name}=none"
+        if not isinstance(tensor, torch.Tensor):
+            return f"{name}=invalid({type(tensor).__name__})"
+
+        with torch.no_grad():
+            t = tensor.detach().float()
+            if t.numel() == 0:
+                return f"{name}=empty"
+
+            finite_mask = torch.isfinite(t)
+            finite_ratio = float(finite_mask.float().mean().item())
+            if finite_ratio < 1.0:
+                t = t[finite_mask]
+                if t.numel() == 0:
+                    return f"{name}=nonfinite(finite_ratio={finite_ratio:.3f})"
+
+            values_abs = t.abs().reshape(-1)
+            values_q = VJEPA_LAM._safe_quantile_1d(values_abs)
+            values_max = float(values_abs.max().item())
+
+            if t.ndim > 0:
+                norms = t.norm(dim=-1).reshape(-1)
+            else:
+                norms = values_abs
+            norms_q = VJEPA_LAM._safe_quantile_1d(norms)
+            norms_mean = float(norms.mean().item())
+            norms_max = float(norms.max().item())
+
+            return (
+                f"{name}[norm_mean={norms_mean:.4g},norm_q50={float(norms_q[0].item()):.4g},"
+                f"norm_q90={float(norms_q[1].item()):.4g},norm_q99={float(norms_q[2].item()):.4g},"
+                f"norm_max={norms_max:.4g},abs_q99={float(values_q[2].item()):.4g},"
+                f"abs_max={values_max:.4g},finite={finite_ratio:.3f}]"
+            )
+
+    def _maybe_log_spike_batch(
+        self,
+        batch: Dict,
+        loss_value: float,
+        aux_losses: Dict[str, Any],
+        current_lr: Optional[float],
+        recon: Optional[Tensor] = None,
+        target: Optional[Tensor] = None,
+        dec_in: Optional[Tensor] = None,
+    ) -> None:
+        # Arm spike diagnostics only after loss first reaches a stable low regime.
+        if not self._spike_armed:
+            if loss_value <= self._spike_arm_loss_threshold:
+                self._spike_armed = True
+                self._spike_arm_step = int(self.global_step)
+                if self.distributed_state.is_main_process:
+                    arm_msg = (
+                        f"[SPIKE_ARMED] step={int(self.global_step)} "
+                        f"loss={loss_value:.4f} arm_threshold={self._spike_arm_loss_threshold:.4f}"
+                    )
+                    if getattr(self, "_trainer", None) is not None:
+                        self.print(arm_msg)
+                    else:
+                        print(arm_msg)
+            return
+        if loss_value < self._spike_loss_threshold:
+            return
+        if not self.distributed_state.is_main_process:
+            return
+        if self.global_step - self._last_spike_log_step < self._spike_log_cooldown:
+            return
+        if self._spike_log_count >= self._spike_log_max_logs:
+            return
+
+        dataset_names = [str(x) for x in batch.get("dataset_names", [])]
+        trajectory_ids = list(batch.get("trajectory_ids", []))
+        base_indices_obj = batch.get("base_indices", [])
+        if isinstance(base_indices_obj, torch.Tensor):
+            base_indices = base_indices_obj.detach().cpu().tolist()
+        else:
+            base_indices = list(base_indices_obj)
+
+        counts = Counter(dataset_names)
+        top_sources = ", ".join([f"{k}:{v}" for k, v in counts.most_common(4)]) if counts else "unknown"
+
+        examples: list[str] = []
+        n = min(len(dataset_names), 8)
+        for i in range(n):
+            traj = trajectory_ids[i] if i < len(trajectory_ids) else -1
+            base = base_indices[i] if i < len(base_indices) else -1
+            examples.append(f"{dataset_names[i]}#{traj}@{base}")
+        examples_str = "; ".join(examples) if examples else "none"
+
+        recon_loss_value = self._to_float(aux_losses.get("recon_loss"), default=float("nan"))
+        state = self._to_float(
+            aux_losses.get("state_loss", aux_losses.get("state_loss_skipped")),
+            default=float("nan"),
+        )
+        lr_str = f"{current_lr:.6g}" if current_lr is not None else "n/a"
+        msg = (
+            f"[SPIKE] step={int(self.global_step)} loss={loss_value:.4f} "
+            f"recon={recon_loss_value:.4f} state={state:.4f} lr={lr_str} "
+            f"sources={top_sources} examples={examples_str}"
+        )
+        if getattr(self, "_trainer", None) is not None:
+            self.print(msg)
+        else:
+            print(msg)
+
+        err_summary = "recon_minus_tgt=unavailable"
+        if isinstance(recon, torch.Tensor) and isinstance(target, torch.Tensor):
+            if tuple(recon.shape) == tuple(target.shape):
+                err_summary = self._summarize_spike_tensor("recon_minus_tgt", recon - target)
+            else:
+                err_summary = (
+                    "recon_minus_tgt=shape_mismatch("
+                    f"recon={tuple(recon.shape)},tgt={tuple(target.shape)})"
+                )
+        stats_msg = (
+            f"[SPIKE_STATS] step={int(self.global_step)} "
+            f"{self._summarize_spike_tensor('recon', recon)} | "
+            f"{self._summarize_spike_tensor('tgt', target)} | "
+            f"{self._summarize_spike_tensor('dec_in', dec_in)} | "
+            f"{err_summary}"
+        )
+        if getattr(self, "_trainer", None) is not None:
+            self.print(stats_msg)
+        else:
+            print(stats_msg)
+        self._spike_log_count += 1
+        self._last_spike_log_step = int(self.global_step)
+
+    def _build_optimizer_param_groups(self) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+        """Build AdamW decay/no-decay param groups for LAM training."""
+        norm_module_types = (
+            nn.LayerNorm,
+            nn.BatchNorm1d,
+            nn.BatchNorm2d,
+            nn.BatchNorm3d,
+            nn.SyncBatchNorm,
+            nn.GroupNorm,
+            nn.InstanceNorm1d,
+            nn.InstanceNorm2d,
+            nn.InstanceNorm3d,
+        )
+
+        trainable_param_names: Dict[int, str] = {}
+        for full_name, param in self.named_parameters():
+            if param.requires_grad and id(param) not in trainable_param_names:
+                trainable_param_names[id(param)] = full_name
+
+        decay_params: List[torch.nn.Parameter] = []
+        no_decay_params: List[torch.nn.Parameter] = []
+        decay_names: List[str] = []
+        no_decay_names: List[str] = []
+        assigned_param_ids = set()
+
+        for module_name, module in self.named_modules():
+            is_norm_module = isinstance(module, norm_module_types)
+            for param_name, param in module.named_parameters(recurse=False):
+                if not param.requires_grad:
+                    continue
+                param_id = id(param)
+                if param_id in assigned_param_ids:
+                    continue
+
+                full_name = f"{module_name}.{param_name}" if module_name else param_name
+                is_bias_like = (param_name == "b") or param_name.endswith("bias")
+                if is_norm_module or is_bias_like:
+                    no_decay_params.append(param)
+                    no_decay_names.append(full_name)
+                else:
+                    decay_params.append(param)
+                    decay_names.append(full_name)
+                assigned_param_ids.add(param_id)
+
+        unassigned_ids = set(trainable_param_names.keys()) - assigned_param_ids
+        extra_ids = assigned_param_ids - set(trainable_param_names.keys())
+        if unassigned_ids or extra_ids:
+            missing_names = [trainable_param_names[param_id] for param_id in sorted(unassigned_ids)]
+            extra_names = []
+            if extra_ids:
+                reverse_assigned = {id(p): n for n, p in zip(decay_names + no_decay_names, decay_params + no_decay_params)}
+                extra_names = [reverse_assigned.get(param_id, str(param_id)) for param_id in sorted(extra_ids)]
+            raise RuntimeError(
+                "Optimizer param grouping mismatch: "
+                f"missing={missing_names[:10]}, extra={extra_names[:10]}"
+            )
+
+        param_groups: List[Dict[str, Any]] = [{"params": decay_params}]
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+        return param_groups, decay_names, no_decay_names
+
+    def _log_optimizer_group_summary(self, decay_names: List[str], no_decay_names: List[str]) -> None:
+        """Print one-time param-group summary on rank0 for sanity check."""
+        if self._optimizer_group_summary_printed:
+            return
+        is_rank0 = True
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            is_rank0 = torch.distributed.get_rank() == 0
+        if not is_rank0:
+            return
+
+        decay_preview = ", ".join(decay_names[:5]) if decay_names else "None"
+        no_decay_preview = ", ".join(no_decay_names[:5]) if no_decay_names else "None"
+        msg = (
+            "[optimizer] exclude_bias_norm_from_wd=True | "
+            f"decay={len(decay_names)} no_decay={len(no_decay_names)} | "
+            f"decay_examples=[{decay_preview}] | "
+            f"no_decay_examples=[{no_decay_preview}]"
+        )
+        if getattr(self, "_trainer", None) is not None:
+            self.print(msg)
+        else:
+            print(msg)
+        self._optimizer_group_summary_printed = True
+
     def shared_step(self, batch: Dict) -> Tuple[Tensor, Dict]:
         """共享的训练/验证步骤（训练分支）。"""
         return self._compute_step(batch=batch, vq_training=True)
@@ -218,7 +516,12 @@ class VJEPA_LAM(LightningModule):
         view2_by_index: Dict[int, torch.Tensor] = {}
         for items in groups.values():
             group_batch = torch.stack([clip for _, clip in items], dim=0).contiguous()
-            video1, video2 = gpu_two_view_video_aug(group_batch, output_size=self.image_hw, training=training)
+            video1, video2 = gpu_two_view_video_aug(
+                group_batch,
+                output_size=self.image_hw,
+                training=training,
+                dual_view_aug=self.dual_view_aug,
+            )
             for pos, (orig_idx, _) in enumerate(items):
                 view1_by_index[orig_idx] = video1[pos]
                 view2_by_index[orig_idx] = video2[pos]
@@ -243,6 +546,7 @@ class VJEPA_LAM(LightningModule):
                     videos_nhwc,
                     output_size=self.image_hw,
                     training=training_aug,
+                    dual_view_aug=self.dual_view_aug,
                 )
                 batch["videos"] = video1
                 batch["dec_videos"] = video2
@@ -320,6 +624,15 @@ class VJEPA_LAM(LightningModule):
             raise RuntimeError(f"Decoder output shape {recon.shape} mismatch target {tgt.shape}.")
 
         target = tgt
+        if vq_training:
+            # Keep detached references for spike-only diagnostics in training_step.
+            self._last_step_tensors = {
+                "recon": recon.detach(),
+                "target": target.detach(),
+                "dec_in": dec_in.detach(),
+            }
+        else:
+            self._last_step_tensors = {}
         # recon_loss = F.mse_loss(recon, target)
         # 余弦相似度指标（不参与梯度计算）
         with torch.no_grad():
@@ -392,7 +705,11 @@ class VJEPA_LAM(LightningModule):
                 aux_loss_logs["state_loss"] = aux_loss.item()
                 total_loss = total_loss + aux_loss
             else:
-                aux_loss_logs["state_loss_skipped"] = 1.0
+                # Keep state decoder in autograd graph for all-human batches to avoid
+                # unused-parameter warnings under DDP while preserving zero contribution.
+                dummy_state_loss = delta_s_pred.sum() * 0.0
+                total_loss = total_loss + dummy_state_loss
+                aux_loss_logs["state_loss_skipped"] = 0.0
 
             logs: Dict[str, Tensor] = {
                 "recon_loss": recon_loss,
@@ -440,6 +757,20 @@ class VJEPA_LAM(LightningModule):
     def training_step(self, batch: Dict, batch_idx: int) -> Tensor:
         """训练步骤"""
         loss, aux_losses = self.shared_step(batch)
+        current_lr = self._get_current_lr()
+        scalar_loss = float(loss.detach().float().item())
+        if current_lr is not None:
+            aux_losses = {**aux_losses, "lr": current_lr}
+        self._maybe_log_spike_batch(
+            batch=batch,
+            loss_value=scalar_loss,
+            aux_losses=aux_losses,
+            current_lr=current_lr,
+            recon=self._last_step_tensors.get("recon"),
+            target=self._last_step_tensors.get("target"),
+            dec_in=self._last_step_tensors.get("dec_in"),
+        )
+        self._last_step_tensors = {}
         
         # 记录训练损失 - Lightning 会自动将数据发送给配置的 WandbLogger
         self.log_dict(
@@ -452,7 +783,7 @@ class VJEPA_LAM(LightningModule):
         )
         if self.distributed_state.is_main_process:
             # 将 tensors 转换为 Python 标量用于 wandb
-            wandb_logs = {"train_loss": loss.item()}
+            wandb_logs = {"train_loss": scalar_loss}
             for k, v in aux_losses.items():
                 if isinstance(v, torch.Tensor):
                     wandb_logs[f"train/{k}"] = v.item()
@@ -461,6 +792,27 @@ class VJEPA_LAM(LightningModule):
             wandb.log(wandb_logs, step=self.global_step)
         
         return loss
+
+    def on_train_epoch_start(self) -> None:
+        """Synchronize mixture epoch so per-sample RNG changes with training epoch."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return
+
+        current_epoch = int(getattr(trainer, "current_epoch", 0))
+        if hasattr(datamodule, "set_mixture_epoch"):
+            datamodule.set_mixture_epoch(current_epoch)
+            return
+
+        # Backward-compatible fallback for custom datamodules.
+        train_dataset = getattr(datamodule, "train_dataset", None)
+        mixture = getattr(train_dataset, "mixture", None) if train_dataset is not None else None
+        if mixture is not None and hasattr(mixture, "set_epoch"):
+            mixture.set_epoch(current_epoch)
     
     @torch.no_grad()
     def validation_step(self, batch: Dict, batch_idx: int) -> Tensor:
@@ -584,7 +936,12 @@ class VJEPA_LAM(LightningModule):
         优化步内将学习率从 0 线性提升到基础学习率，之后保持常数学习率。
         以 step 为粒度进行调度。
         """
-        optim = self.optimizer(self.parameters())
+        if self.exclude_bias_norm_from_wd:
+            param_groups, decay_names, no_decay_names = self._build_optimizer_param_groups()
+            optim = self.optimizer(param_groups)
+            self._log_optimizer_group_summary(decay_names, no_decay_names)
+        else:
+            optim = self.optimizer(self.parameters())
         # optim = self.optimizer(filter(lambda p: p.requires_grad, self.parameters()))
         if self.warmup_steps > 0:
             def lr_lambda(current_step: int) -> float:

@@ -85,11 +85,12 @@ def gpu_two_view_video_aug(
     output_size: Tuple[int, int] = LAM_IMAGE_HW,
     scale: Tuple[float, float] = (0.8, 1.0),
     ratio: Tuple[float, float] = (1.0, 1.3),
-    brightness: float = 0.3,
-    contrast: float = 0.4,
-    saturation: float = 0.5,
-    hue: float = 0.08,
+    brightness: float = 0.2,
+    contrast: float = 0.2,
+    saturation: float = 0.25,
+    hue: float = 0.04,
     training: bool = True,
+    dual_view_aug: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     GPU-side two-view video augmentation.
@@ -111,17 +112,25 @@ def gpu_two_view_video_aug(
             saturation=saturation,
             hue=hue,
         )
+        # Batch-level augmentation: apply one transform call on the whole batch tensor.
         video1 = train_aug(frames)
-        video2 = train_aug(frames)
+        if dual_view_aug:
+            video2 = train_aug(frames)
+        else:
+            video2 = None
     else:
         eval_aug = _build_eval_aug(output_size)
         video1 = eval_aug(frames)
-        video2 = video1.clone()
+        video2 = None
 
     video1 = _uint8_to_unit_float(video1)
-    video2 = _uint8_to_unit_float(video2)
     imagenet_normalize_(video1)
-    imagenet_normalize_(video2)
+
+    if video2 is not None:
+        video2 = _uint8_to_unit_float(video2)
+        imagenet_normalize_(video2)
+    else:
+        video2 = video1.clone()
     return video1, video2
 
 

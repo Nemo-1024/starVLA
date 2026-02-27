@@ -175,7 +175,6 @@ This module follows FlowMatchingHead's time/noise schedule and linear path.
 class ConditionalFlowMatchingConfig:
     # 动作维度（输出）
     action_dim: int = 7
-    window_size: int = 10
     # Flow 维度与步数
     hidden_dim: int = 768
     num_layers: int = 12  #DiT层数
@@ -183,7 +182,7 @@ class ConditionalFlowMatchingConfig:
     cfg_drop_prob: float = 0.1
         # Inference controls
     cfg_guidance_scale: float = 1.0
-    num_inference_steps: int = 20
+    num_inference_steps: int = 4
     num_timestep_buckets: int = 1000
 
     # 可学习编码器（内部构造 cond）所需配置
@@ -311,9 +310,17 @@ class ConditionalFlowMatchingHead(nn.Module):
         state: torch.Tensor, # [B, D]
         actions: torch.Tensor, # [B, T, K]
         embodiment_id: torch.Tensor,  # [B]
+        action_horizon: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,  # [B, vlm_seq_len] VLM 的 attention_mask
     ) -> torch.Tensor:
-        assert actions.shape[1] == self.config.window_size, "actions.shape[1] must be equal to window_size"
+        if action_horizon is None:
+            action_horizon = int(actions.shape[1])
+        action_horizon = int(action_horizon)
+        if int(actions.shape[1]) != action_horizon:
+            raise ValueError(
+                "Flow training action horizon mismatch: "
+                f"actions.shape[1]={int(actions.shape[1])}, action_horizon={action_horizon}."
+            )
         model_dtype = self._compute_dtype()
         h_t = self._cast_if_needed(h_t, model_dtype)
         h_t1_star = self._cast_if_needed(h_t1_star, model_dtype)
@@ -372,8 +379,6 @@ class ConditionalFlowMatchingHead(nn.Module):
             hidden_states = torch.cat((cond_state, noisy_trajectory), dim=1)
         else:
             hidden_states = noisy_trajectory
-        
-        action_horizon = noisy_trajectory.shape[1]  # 记录动作序列长度，确保与推理时一致
         
         # 构造 encoder_attention_mask：视觉部分(h_t+h_t1)全关注 + VLM部分使用原始 attention_mask
         num_vision = h_t.shape[1] + cond_future.shape[1]  # 256 + 256 = 512
@@ -438,6 +443,7 @@ class ConditionalFlowMatchingHead(nn.Module):
         h_t1_star: torch.Tensor,
         h_vlm: torch.Tensor,
         state: torch.Tensor,
+        action_horizon: int,
         embodiment_id: torch.Tensor,  # [B]
         cfg_scale: Optional[float] = None,
         num_inference_steps: Optional[int] = None,
@@ -466,7 +472,9 @@ class ConditionalFlowMatchingHead(nn.Module):
         h_vlm = self._cast_if_needed(h_vlm, model_dtype)
         state = self._cast_if_needed(state, model_dtype)
         batch_size = h_t.shape[0]
-        action_horizon = self.config.window_size
+        action_horizon = int(action_horizon)
+        if action_horizon <= 0:
+            raise ValueError(f"`action_horizon` must be > 0, got {action_horizon}.")
         # 默认从 config 读取（便于在 YAML 里通过 ConditionalFlowMatchingConfig 统一管理）
         if num_inference_steps is None:
             num_inference_steps = int(getattr(self.config, "num_steps", 50))

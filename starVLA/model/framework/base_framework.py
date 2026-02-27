@@ -95,6 +95,24 @@ class baseframework(PreTrainedModel):
         # logger.info(f"Loading model weights from `{pretrained_checkpoint}`")
         model_keys = set(FrameworkModel.state_dict().keys())
         checkpoint_keys = set(model_state_dict.keys())
+        framework_name = str(getattr(model_config.framework, "name", "")).lower()
+        if framework_name in {"latentworldvlaindependent", "latent_world_vla_independent"}:
+            required_prefixes = (
+                "policy_backend.act_query",
+                "policy_backend.vlm_to_lam.",
+                "policy_backend.flow.",
+                "policy_backend.lam.decoder.",
+            )
+            prefix_counts = {
+                prefix: sum(1 for k in checkpoint_keys if k == prefix or k.startswith(prefix))
+                for prefix in required_prefixes
+            }
+            missing_prefixes = [prefix for prefix, count in prefix_counts.items() if count == 0]
+            if missing_prefixes:
+                raise RuntimeError(
+                    "[LatentWorldPolicy] invalid full checkpoint: "
+                    f"missing required key prefixes {missing_prefixes} in `{pretrained_checkpoint}`."
+                )
         try:
             FrameworkModel.load_state_dict(model_state_dict, strict=True)
         except RuntimeError as e:
@@ -108,54 +126,22 @@ class baseframework(PreTrainedModel):
                 logger.warning(f"Unexpected keys in state_dict: {unexpected_keys}")
 
             raise e
-
-        # **ensure model is on GPU**
-        FrameworkModel = FrameworkModel
-        return FrameworkModel
-
-    @staticmethod
-    def _check_unnorm_key(norm_stats, unnorm_key):
-        """
-        Infer or validate the dataset stats key used for un-normalization.
-
-        Args:
-            norm_stats: Dict[str, dict] mapping dataset key -> stats block.
-            unnorm_key: Optional explicit dataset key.
-
-        Returns:
-            str: Resolved key.
-
-        Raises:
-            AssertionError: If multiple datasets present and key not provided,
-                            or provided key not found.
-        """
-        if unnorm_key is None:
-            assert len(norm_stats) == 1, (
-                f"Your model was trained on more than one dataset, "
-                f"please pass a `unnorm_key` from the following options to choose the statistics "
-                f"used for un-normalizing actions: {norm_stats.keys()}"
+        if framework_name in {"latentworldvlaindependent", "latent_world_vla_independent"}:
+            logger.info(
+                "[LatentWorldPolicy] Full checkpoint loaded | path=%s | total_keys=%d | %s=%d | %s=%d | %s=%d | %s=%d",
+                str(pretrained_checkpoint),
+                len(checkpoint_keys),
+                "policy_backend.act_query",
+                prefix_counts["policy_backend.act_query"],
+                "policy_backend.vlm_to_lam.",
+                prefix_counts["policy_backend.vlm_to_lam."],
+                "policy_backend.flow.",
+                prefix_counts["policy_backend.flow."],
+                "policy_backend.lam.decoder.",
+                prefix_counts["policy_backend.lam.decoder."],
             )
-            unnorm_key = next(iter(norm_stats.keys()))
 
-        assert unnorm_key in norm_stats, (
-            f"The `unnorm_key` you chose is not in the set of available dataset statistics, "
-            f"please choose from: {norm_stats.keys()}"
-        )
-        return unnorm_key
-
-    @classmethod
-    def get_action_stats(self, unnorm_key=None):
-        """
-        Retrieve raw action normalization statistics.
-
-        Args:
-            unnorm_key: Optional dataset stats key.
-
-        Returns:
-            dict: Stats structure (e.g. q01, q99, mask).
-        """
-        unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
-        return self.norm_stats[unnorm_key]["action"]
+        return FrameworkModel
 
     @property
     def trainable_module_keys(self, max_depth=1) -> List[str]:

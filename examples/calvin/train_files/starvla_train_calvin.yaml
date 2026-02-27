@@ -48,7 +48,6 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/calvin
     data_mix: calvin_task_D_D # libero_goal
     action_type: delta_qpos

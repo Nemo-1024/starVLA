@@ -35,10 +35,8 @@ import pandas as pd
 from pydantic import BaseModel, Field, ValidationError
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from PIL import Image
 import torch.distributed as dist
 
-from starVLA.dataloader.gr00t_lerobot.image_preprocess import preprocess_pil_image
 from starVLA.dataloader.gr00t_lerobot.video import get_all_frames, get_frames_by_timestamps
 
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EMBODIMENT_TAG_MAPPING, EmbodimentTag
@@ -65,16 +63,6 @@ LE_ROBOT_TASKS_FILENAME = "meta/tasks.parquet"
 LE_ROBOT_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 EPSILON = 5e-4
 
-
-def _resolve_image_resolution(data_cfg, default: int) -> int:
-    if data_cfg is not None and hasattr(data_cfg, "get"):
-        value = data_cfg.get("image_resolution", None)
-        if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                raise ValueError(f"Invalid `image_resolution`: {value!r}. Expected an integer.")
-    return int(default)
 
 
 def _resolve_embodiment_id_from_tag(tag: str) -> int:
@@ -154,6 +142,8 @@ class LeRobotSingleDataset(Dataset):
         dataset_path: Path | str,
         modality_configs: dict[str, ModalityConfig],
         embodiment_tag: str | EmbodimentTag,
+        mode: str = "all",
+        _val_tail_ratio: float = 0.01,
         video_backend: str = "pyav",
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
@@ -175,7 +165,6 @@ class LeRobotSingleDataset(Dataset):
         """
         # first check if the path directory exists
         self.data_cfg = data_cfg
-        self.image_resolution = _resolve_image_resolution(self.data_cfg, default=224)
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
         # Internal switch: recompute stats at runtime and overwrite cached file.
@@ -201,6 +190,11 @@ class LeRobotSingleDataset(Dataset):
 
         self._dataset_path = Path(dataset_path)
         self._dataset_name = self._dataset_path.name
+        normalized_mode = str(mode).lower()
+        if normalized_mode not in {"train", "val", "test", "all"}:
+            raise ValueError(f"Unsupported dataset mode `{mode}`. Expected one of ['train', 'val', 'test'].")
+        self._split_mode = "val" if normalized_mode == "test" else normalized_mode
+        self._val_tail_ratio = float(_val_tail_ratio)
         if isinstance(embodiment_tag, EmbodimentTag):
             self.tag = embodiment_tag.value
         else:
@@ -230,13 +224,21 @@ class LeRobotSingleDataset(Dataset):
         self._load_episodes_hf()
         self._load_hf_dataset()
 
-        self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
+        full_trajectory_ids, full_trajectory_lengths = self._get_trajectories()
+        self._all_trajectory_ids = full_trajectory_ids
+        self._all_trajectory_lengths = full_trajectory_lengths
+        self._build_mode_split_from_trajectories()
+        self._build_active_step_indexing()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
-        print(f"Initialized dataset {self.dataset_name} with {embodiment_tag}")
+        print(
+            f"Initialized dataset {self.dataset_name} with {embodiment_tag} "
+            f"(mode={self._split_mode}, val_tail_ratio={self._val_tail_ratio:.4f}, "
+            f"active_trajectories={len(self._trajectory_ids)}, active_steps={self._subset_total_steps})"
+        )
 
 
         # Check if the dataset is valid
@@ -470,9 +472,9 @@ class LeRobotSingleDataset(Dataset):
         
             print(f"[RANK 0] Dataset statistics cached to {stats_path}")
         
-        # ---------- sync ----------
-        if dist.is_initialized():
-            dist.barrier()
+        # # ---------- sync ----------
+        # if dist.is_initialized():
+        #     dist.barrier()
         
         # ---------- all rank read again ----------
         if le_statistics is None:
@@ -532,19 +534,102 @@ class LeRobotSingleDataset(Dataset):
             print(f"[INFO] Video keys from episodes (official): {self._detected_video_keys}")
         return np.array(trajectory_ids), np.array(trajectory_lengths)
 
+    def _build_mode_split_from_trajectories(self) -> None:
+        """Build deterministic train/val split using trajectory order and tail ratio."""
+        total_traj = int(len(self._all_trajectory_ids))
+        if total_traj == 0:
+            self._active_episode_indices = np.array([], dtype=np.int64)
+            self._active_traj_ids = np.array([], dtype=np.int64)
+            self._trajectory_ids = self._active_traj_ids
+            self._trajectory_lengths = np.array([], dtype=np.int64)
+            self._trajectory_id_to_index_active = {}
+            return
+
+        n_val_base = int(np.floor(total_traj * self._val_tail_ratio))
+        if total_traj >= 2:
+            n_val = max(1, n_val_base)
+            n_val = min(n_val, total_traj - 1)
+        else:
+            # Keep single-trajectory dataset in train set.
+            n_val = 0
+
+        split_at = total_traj - n_val
+        if self._split_mode == "train":
+            active_slice = slice(0, split_at)
+        elif self._split_mode == "val":
+            active_slice = slice(split_at, total_traj)
+        elif self._split_mode == "all":
+            active_slice = slice(0, total_traj)
+        else:
+            raise ValueError(f"Invalid split mode: {self._split_mode}")
+
+        active_ids = self._all_trajectory_ids[active_slice].astype(np.int64, copy=False)
+        active_lengths = self._all_trajectory_lengths[active_slice].astype(np.int64, copy=False)
+
+        self._active_episode_indices = active_ids
+        self._active_traj_ids = active_ids
+        self._trajectory_ids = active_ids
+        self._trajectory_lengths = active_lengths
+        self._trajectory_id_to_index_active = {
+            int(traj_id): idx for idx, traj_id in enumerate(self._trajectory_ids.tolist())
+        }
+
+    def _build_active_step_indexing(self) -> None:
+        """Build local-step indexing arrays for fast local->absolute index mapping."""
+        if len(self._active_episode_indices) == 0:
+            self._subset_from_indices = np.array([], dtype=np.int64)
+            self._subset_lengths = np.array([], dtype=np.int64)
+            self._subset_cum_lengths = np.array([], dtype=np.int64)
+            self._subset_total_steps = 0
+            return
+
+        from_indices = []
+        lengths = []
+        for ep_idx in self._active_episode_indices.tolist():
+            row_idx = self._episode_index_to_row[int(ep_idx)]
+            row = self.episodes_hf[row_idx]
+            from_indices.append(int(row["dataset_from_index"]))
+            lengths.append(int(row["length"]))
+
+        self._subset_from_indices = np.asarray(from_indices, dtype=np.int64)
+        self._subset_lengths = np.asarray(lengths, dtype=np.int64)
+        self._subset_cum_lengths = np.cumsum(self._subset_lengths, dtype=np.int64)
+        self._subset_total_steps = int(self._subset_cum_lengths[-1]) if len(self._subset_cum_lengths) > 0 else 0
+
+    def _local_to_abs_index(self, local_idx: int) -> int:
+        """Map mode-local step index to absolute hf_dataset index."""
+        if self._subset_total_steps <= 0:
+            raise IndexError(
+                f"Dataset split `{self._split_mode}` has no available steps for dataset `{self.dataset_name}`."
+            )
+        idx = int(local_idx)
+        if idx < 0:
+            idx += self._subset_total_steps
+        if idx < 0 or idx >= self._subset_total_steps:
+            raise IndexError(
+                f"Index {local_idx} out of range for dataset `{self.dataset_name}` split `{self._split_mode}` "
+                f"with length {self._subset_total_steps}."
+            )
+
+        traj_local_idx = int(np.searchsorted(self._subset_cum_lengths, idx, side="right"))
+        prev_cum = 0 if traj_local_idx == 0 else int(self._subset_cum_lengths[traj_local_idx - 1])
+        offset_in_traj = idx - prev_cum
+        return int(self._subset_from_indices[traj_local_idx] + offset_in_traj)
+
     def abs_index_to_episode_step(self, abs_idx: int) -> tuple[int, int]:
-        """Convert a global frame index to (trajectory_id, base_index).
+        """Convert a mode-local frame index to (trajectory_id, base_index).
         
         This follows the official LeRobot v3 approach: use hf_dataset absolute index
         and map it to episode-relative index using episode metadata.
         
         Args:
-            abs_idx: Global index into hf_dataset (0 <= abs_idx < len(hf_dataset))
+            abs_idx: Mode-local index into active subset (0 <= abs_idx < len(self))
             
         Returns:
             tuple[int, int]: (trajectory_id, base_index) where base_index is 
                 the step's position within the trajectory.
         """
+        abs_idx = self._local_to_abs_index(int(abs_idx))
         item = self.hf_dataset[abs_idx]
         trajectory_id = int(item["episode_index"])
         try:
@@ -839,7 +924,7 @@ class LeRobotSingleDataset(Dataset):
         """
         if self.hf_dataset is None:
             raise RuntimeError("hf_dataset is not loaded. Ensure _load_hf_dataset() ran successfully.")
-        return len(self.hf_dataset)
+        return self._subset_total_steps
 
     def __str__(self) -> str:
         """Get the description of the dataset."""
@@ -857,6 +942,7 @@ class LeRobotSingleDataset(Dataset):
         """
         if self.hf_dataset is None:
             raise RuntimeError("hf_dataset is not loaded. Ensure _load_hf_dataset() ran successfully.")
+        index = self._local_to_abs_index(int(index))
         item = self.hf_dataset[index]
         trajectory_id = int(item["episode_index"])
         # Calculate base_index within episode using dataset_from_index
@@ -876,9 +962,8 @@ class LeRobotSingleDataset(Dataset):
                     f"Expected video array shape [T, H, W, C] for key={video_key}, got {view_frames.shape}"
                 )
 
-            view_images = [preprocess_pil_image(Image.fromarray(frame)) for frame in view_frames]
-            images.append(view_images[0])
-            videos.append(view_images)
+            images.append(view_frames[0])
+            videos.append(list(view_frames))
         
         # Get language and action data
         language = data[self.modality_keys["language"][0]][0]
@@ -987,7 +1072,7 @@ class LeRobotSingleDataset(Dataset):
             int: The index of the trajectory in the dataset.
         """
         try:
-            return self._trajectory_id_to_index[trajectory_id]
+            return self._trajectory_id_to_index_active[trajectory_id]
         except KeyError as exc:
             raise ValueError(f"Error finding trajectory index for {trajectory_id}") from exc
 
@@ -1743,7 +1828,6 @@ class LeRobotMixtureDataset(Dataset):
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
-        self.image_resolution = _resolve_image_resolution(self.data_cfg, default=256)
 
         # Set properties for sampling
 
@@ -1841,9 +1925,9 @@ class LeRobotMixtureDataset(Dataset):
         dataset_index = rng.choice(len(self.datasets), p=self.dataset_sampling_weights)
         dataset = self.datasets[dataset_index]
 
-        # Sample abs index uniformly from hf_dataset, then map to (trajectory_id, base_index)
-        abs_idx = rng.integers(0, len(dataset))
-        trajectory_id, base_index = dataset.abs_index_to_episode_step(abs_idx)
+        # Sample local index uniformly from active split, then map to (trajectory_id, base_index)
+        local_idx = rng.integers(0, len(dataset))
+        trajectory_id, base_index = dataset.abs_index_to_episode_step(local_idx)
         return dataset, trajectory_id, base_index
 
     def __getitem__(self, index: int) -> dict:
@@ -1873,7 +1957,7 @@ class LeRobotMixtureDataset(Dataset):
                 
                 # Process all video keys dynamically:
                 # - Primary views: keep full video sequence for LAM + first frame for VLM.
-                # - Wrist views: keep first frame only (no wrist video sequence in current pipeline).
+                # - Wrist views: keep first frame only; LatentWorld batch builder promotes it to T=1 wrist_videos.
                 prim_images = []
                 wrist_images = []
                 prim_videos = []
@@ -1884,69 +1968,36 @@ class LeRobotMixtureDataset(Dataset):
                             f"Expected video array shape [T, H, W, C] for key={video_key}, got {view_frames.shape}"
                         )
                     if "wrist" not in video_key:
-                        view_images = [
-                            preprocess_pil_image(Image.fromarray(frame))
-                            for frame in view_frames
-                        ]
-                        first_image = view_images[0]
-                        prim_images.append(first_image)
-                        prim_videos.append(view_images)
+                        prim_images.append(view_frames[0])
+                        prim_videos.append(list(view_frames))
                     else:
                         # Wrist view is consumed as a single image only; avoid converting the full sequence.
-                        first_image = preprocess_pil_image(Image.fromarray(view_frames[0]))
-                        wrist_images.append(first_image)
+                        wrist_images.append(view_frames[0])
                 all_images = prim_images + wrist_images
                 all_videos = prim_videos
                 
                 # Get language and state/action data from transform outputs
                 language = data[dataset.modality_keys["language"][0]][0]
-                missing_action_keys = [key for key in ["action", "action_mask"] if key not in data]
+                missing_action_keys = [key for key in ["action"] if key not in data]
                 if missing_action_keys:
                     raise KeyError(
                         f"Missing required transformed keys {missing_action_keys} for dataset "
-                        f"{dataset.dataset_name}. Ensure ConcatTransform is configured."
+                        f"{dataset.dataset_name}. Ensure action transforms and concat are configured."
                     )
                 action = data["action"]
-                action_mask = data["action_mask"]
-
-                include_state = (
-                    self.data_cfg is not None
-                    and self.data_cfg.get("include_state", False) not in ["False", False]
-                )
-
-                if include_state:
-                    missing_state_keys = [key for key in ["state", "state_mask"] if key not in data]
-                    if missing_state_keys:
-                        raise KeyError(
-                            f"Missing required transformed keys {missing_state_keys} for dataset "
-                            f"{dataset.dataset_name} with include_state=True. "
-                            "Ensure ConcatTransform is configured with state_concat_order."
-                        )
-                    return dict(
-                        action=action,
-                        action_mask=action_mask,
-                        image=all_images,
-                        video=all_videos,
-                        primary_images=prim_images,
-                        wrist_images=wrist_images,
-                        primary_videos=prim_videos,
-                        lang=language,
-                        state=data["state"],
-                        state_mask=data["state_mask"],
-                        embodiment_id=int(dataset.embodiment_id),
-                    )
 
                 return dict(
                     action=action,
-                    action_mask=action_mask,
                     image=all_images,
                     video=all_videos,
                     primary_images=prim_images,
                     wrist_images=wrist_images,
                     primary_videos=prim_videos,
                     lang=language,
+                    state=data["state"],
                     embodiment_id=int(dataset.embodiment_id),
                 )
+
                 
             except Exception as e:
                 last_exception = e

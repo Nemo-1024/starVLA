@@ -3,16 +3,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
-SCRIPT_PATH="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
 
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 # used for check save when communication
-export NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
+export DEEPSPEED_LOG_LEVEL=error
+export TRITON_CACHE_DIR=/tmp/triton_cache
+mkdir -p "${TRITON_CACHE_DIR}/autotune"
 
 # Auto-select a valid NCCL network interface if user does not provide one.
 if [[ -z "${NCCL_SOCKET_IFNAME:-}" ]]; then
@@ -34,17 +36,12 @@ if [[ -z "${NCCL_IB_HCA:-}" ]] && [[ -d "/sys/class/infiniband" ]]; then
   fi
 fi
 ###########################################################################################
-# === Please modify the following paths according to your environment ===
-Framework_name="${FRAMEWORK_NAME:-LatentWorldVLAIndependent}"
-freeze_module_list="${FREEZE_MODULE_LIST:-}"
-base_vlm="${BASE_VLM:-/mnt/project_rlinf/jlchen/weights/Qwen3-VL-2B-Instruct}"
-config_yaml="${CONFIG_YAML:-./examples/LIBERO/train_files/starvla_latent_world_vla_libero.yaml}"
-libero_data_root="${LIBERO_DATA_ROOT:-/mnt/project_rlinf/jlchen/datasets}"
-data_mix="${DATA_MIX:-libero}"
-video_backend="${VIDEO_BACKEND:-pyav}"
-run_root_dir="${RUN_ROOT_DIR:-./results/Checkpoints}"
-run_id="${RUN_ID:-1229_libero_latent_world_vla}"
-# === End of environment variable configuration ===
+# Select training YAML:
+# 1) first positional arg
+# 2) CONFIG_YAML env
+# 3) default path
+config_yaml="${1:-${CONFIG_YAML:-./examples/LIBERO/train_files/starvla_latent_world_vla_libero.yaml}}"
+accelerate_config="${ACCELERATE_CONFIG:-starVLA/config/accelerate/ddp_bf16.yaml}"
 ###########################################################################################
 
 num_processes="${NUM_PROCESSES:-$(python - <<'PY'
@@ -52,63 +49,34 @@ import torch
 print(max(torch.cuda.device_count(), 1))
 PY
 )}"
-per_device_batch_size="${PER_DEVICE_BATCH_SIZE:-16}"
-max_train_steps="${MAX_TRAIN_STEPS:-80000}"
-save_interval="${SAVE_INTERVAL:-10000}"
-logging_frequency="${LOGGING_FREQUENCY:-100}"
-eval_interval="${EVAL_INTERVAL:-100}"
-
-# export WANDB_MODE=disabled
-
-output_dir=${run_root_dir}/${run_id}
-mkdir -p ${output_dir}
-# mv this script to the output dir
-cp "${SCRIPT_PATH}" "${output_dir}/"
-
+main_process_port="${MAIN_PROCESS_PORT:-$(python - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)}"
+if [[ ! -f "${config_yaml}" ]]; then
+  echo "Config file not found: ${config_yaml}" >&2
+  exit 1
+fi
+if [[ ! -f "${accelerate_config}" ]]; then
+  echo "Accelerate config not found: ${accelerate_config}" >&2
+  exit 1
+fi
 
 accelerate_cmd=(
   accelerate launch
-  --config_file starVLA/config/accelerate/ddp_bf16.yaml
+  --config_file "${accelerate_config}"
   --num_processes "${num_processes}"
+  --main_process_port "${main_process_port}"
   starVLA/training/train_starvla.py
   --config_yaml "${config_yaml}"
-  --framework.name "${Framework_name}"
-  --framework.qwenvl.base_vlm "${base_vlm}"
-  --datasets.vla_data.data_root_dir "${libero_data_root}"
-  --datasets.vla_data.data_mix "${data_mix}"
-  --datasets.vla_data.per_device_batch_size "${per_device_batch_size}"
-  --datasets.vla_data.video_backend "${video_backend}"
-  --trainer.max_train_steps "${max_train_steps}"
-  --trainer.save_interval "${save_interval}"
-  --trainer.logging_frequency "${logging_frequency}"
-  --trainer.eval_interval "${eval_interval}"
-  --run_root_dir "${run_root_dir}"
-  --run_id "${run_id}"
-  --wandb_project starVLA_Libero
 )
 
-if [[ -n "${freeze_module_list}" ]]; then
-  accelerate_cmd+=(--trainer.freeze_modules "${freeze_module_list}")
-fi
+echo "Using config: ${config_yaml}"
+echo "Using accelerate config: ${accelerate_config}"
+echo "Using main process port: ${main_process_port}"
 
 "${accelerate_cmd[@]}"
-
-
-
-##### Multi-Server Multi-GPU training script #####
-  # accelerate launch \
-  #   --config_file starVLA/config/accelerate/ddp_bf16.yaml \
-  #   --main_process_ip $MASTER_ADDR \
-  #   --main_process_port $MASTER_PORT \
-  #   --machine_rank $SLURM_PROCID \
-  #   --num_machines $SLURM_NNODES \
-  #   --num_processes=${TOTAL_GPUS} \
-  #   starVLA/training/train_starvla.py \
-  #   --config_yaml ${config_yaml} \
-  #   --framework.name ${Framework_name} \
-  #   --framework.qwenvl.base_vlm ${base_vlm} \
-  #   --run_root_dir ${run_root_dir} \
-  #   --run_id ${run_id} \
-  #   --wandb_project your_project \
-  #   --wandb_entity your_name
-##### Multi-Server Multi-GPU training script #####

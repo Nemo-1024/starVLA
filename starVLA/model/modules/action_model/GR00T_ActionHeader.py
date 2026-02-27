@@ -233,12 +233,12 @@ class FlowmatchingActionHead(nn.Module):
         self.action_horizon = config.future_action_window_size + 1
         self.num_inference_timesteps = config.num_inference_timesteps
 
-        self.state_encoder = MLP(
-            input_dim=config.state_dim,
-            hidden_dim=self.hidden_size,
-            output_dim=self.input_embedding_dim,
-        ) if config.state_dim else None
-
+        # self.state_encoder = MLP(
+        #     input_dim=config.state_dim,
+        #     hidden_dim=self.hidden_size,
+        #     output_dim=self.input_embedding_dim,
+        # ) if config.state_dim else None
+        self.state_encoder = None
         self.action_encoder = ActionEncoder(
             action_dim=config.action_dim,
             hidden_size=self.input_embedding_dim,

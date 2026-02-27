@@ -12,26 +12,22 @@ framework:
   qwenvl:
     # base_vlm: "/mnt/project_rlinf/jlchen/code/UniVLA/vla_scripts/vla_log/0205_180315+vla_emb_gt_lam_plus/checkpoints/checkpoint-170000"
     base_vlm: "/mnt/project_rlinf/jlchen/weights/Qwen3-VL-2B-Instruct"
-  latent_world:
+  action_model:
+    future_action_window_size: 7
+    past_action_window_size: 0
+    action_horizon: 8
     lam_ckpt_path: "/mnt/project_rlinf/jlchen/code/starVLA/latent_action_model/logs/dino_base_ae_bigwin/version_1/checkpoints/epoch=2.ckpt"
     lam_yaml_path: "/mnt/project_rlinf/jlchen/code/starVLA/latent_action_model/logs/dino_base_ae_bigwin/version_1/dino_base_ae.yaml"
     num_action_queries: 8
     perceptual_weight: 0.1
-    freeze_vision_backbone: true
-    freeze_llm_backbone: true
-    freeze_last_llm_layer: true
-    freeze_embedding: true
-    unfreeze_vision_merger: true
-    unfreeze_llm_last_n_layers: 4
-    unfreeze_lam_decoder: true
     latent_action_placeholder_token: "<ACT_PH>"
+    flow_only_mode: false
     future_prediction: true
-    enable_wrist_view: false # 当前数据契约不提供 wrist_videos；设为 true 会在 LatentWorldBatchBuilder 直接报错
+    enable_wrist_view: false # 设为 true 时要求样本提供单腕 wrist_images（当前不处理 None/多腕）
     enable_loss_distill: true
     lam_encoder_distill_weight: 0.1
     flow_cfg:
       action_dim: 7
-      window_size: 10
       state_dim: 8
       vlm_dim: 2048
       # vision_dim: 768 # 基本无效：LatentWorldVLA 初始化会自动对齐为 LAM 输出维度
@@ -52,7 +48,6 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
     data_root_dir: "/mnt/project_rlinf/jlchen/datasets"
     data_mix: libero
     # data_mix_fallback: libero # 无效：当前 dataloader/训练入口未读取该字段
@@ -63,24 +58,31 @@ datasets:
     # obs: ["image_0"] # 无效：当前视角来源由 robot_type 对应 data_config.video_keys 决定
     video_backend: pyav
     num_frames: 2
-    include_state: true
     # image_aug: true # 无效：当前 VLA dataloader/transform 路径未读取该字段
     # shuffle_buffer_size: 20000 # 无效：当前 dataloader 不做该字段控制的缓存打乱
     # use_history_frame: false # 无效：当前 VLA 训练路径未读取该字段
     # debug_repeat_batch: false # 无效：当前 VLA 训练路径未读取该字段
-    # window_size: 10 # 无效：动作窗口使用的是 framework.latent_world.flow_cfg.window_size
+    # action_horizon: 10 # 无效：动作窗口来自 framework.action_model.action_horizon
 
 trainer:
   max_train_steps: 50000
   num_warmup_steps: 5000
   save_interval: 10000
   eval_interval: 2000
+  eval_batches: 50
   learning_rate:
     base: 1.0e-4
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  freeze_modules: ""
+  freeze:
+    freeze_vision_backbone: true
+    freeze_llm_backbone: true
+    freeze_last_llm_layer: true
+    freeze_embedding: true
+    unfreeze_vision_merger: true
+    unfreeze_llm_last_n_layers: 4
+    unfreeze_lam_decoder: true
   logging_frequency: 50
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
@@ -112,9 +114,11 @@ trainer:
 #     enable_wrist_view: true
 #     enable_loss_distill: true
 #     lam_encoder_distill_weight: 0.1
+#     future_action_window_size: 9
+#     past_action_window_size: 0
+#     action_horizon: 10
 #     flow_cfg:
 #       action_dim: 7
-#       window_size: 10
 #       state_dim: 8
 #       vlm_dim: 2048
 #       vision_dim: 768
@@ -138,7 +142,7 @@ trainer:
 #   image_aug: true
 #   use_history_frame: false
 #   debug_repeat_batch: false
-#   window_size: 10
+#   action_horizon: 10
 #   batch_size: 64
 #   max_steps: 50000
 #   warmup_steps: 5000

@@ -46,7 +46,6 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/OXE_LEROBOT_DATASET
     data_mix: bridge_rt_1 # bridge_rt_1
     action_type: delta_ee
@@ -64,6 +63,7 @@ trainer:
   num_warmup_steps: 5000
   save_interval: 5000
   eval_interval: 100
+  eval_batches: 50
   learning_rate:
     base: 1e-05
     qwen_vl_interface: 1.0e-05

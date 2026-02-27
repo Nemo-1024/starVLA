@@ -16,7 +16,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import time
@@ -38,6 +38,7 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
+from starVLA.training.trainer_utils.trainer_tools import apply_training_freeze_policy
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 from starVLA.training.trainer_utils.config_tracker import wrap_config, AccessTrackedConfig
 
@@ -71,7 +72,16 @@ def build_accelerator(cfg) -> Accelerator:
 
 def setup_directories(cfg) -> Path:
     """create output directory and save config"""
-    cfg.output_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
+    base_run_id = str(cfg.run_id)
+    if dist.is_initialized():
+        timestamp_list = [time.strftime("%m%d_%H%M%S") if dist.get_rank() == 0 else None]
+        dist.broadcast_object_list(timestamp_list, src=0)
+        timestamp = timestamp_list[0]
+    else:
+        timestamp = time.strftime("%m%d_%H%M%S")
+    run_folder_name = f"{timestamp}+{base_run_id}"
+
+    cfg.output_dir = os.path.join(cfg.run_root_dir, run_folder_name)
     output_dir = Path(cfg.output_dir)
 
     if not dist.is_initialized() or dist.get_rank() == 0:
@@ -97,21 +107,21 @@ def build_model(cfg) -> torch.nn.Module:
 
 
 # here changes need to 📦 encapsulate Dataloader
-from starVLA.dataloader import build_dataloader
+from starVLA.dataloader import build_dataloaders
 
 
-def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
+def prepare_data(cfg, accelerator) -> tuple[DataLoader, Optional[DataLoader]]:
     """prepare training data"""
     # VLA data loader
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
-    vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+    vla_train_dataloader, vla_val_dataloader = build_dataloaders(cfg=cfg)
 
     if accelerator.dataloader_config is not None:
         accelerator.dataloader_config.dispatch_batches = False
-    if dist.is_initialized():
-        dist.barrier()
+    # if dist.is_initialized():
+    #     dist.barrier()
 
-    return vla_train_dataloader
+    return vla_train_dataloader, vla_val_dataloader
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -144,10 +154,20 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(
+        self,
+        cfg,
+        model,
+        vla_train_dataloader,
+        optimizer,
+        lr_scheduler,
+        accelerator,
+        vla_val_dataloader=None,
+    ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.vla_val_dataloader = vla_val_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
@@ -169,24 +189,27 @@ class VLATrainer(TrainerUtils):
         # 根据  resume 调整 lr_scheduler
         self._adjust_lr_scheduler_for_resume()
 
-        # freeze parameters
-        freeze_modules = (
-            self.config.trainer.freeze_modules
-            if (self.config and hasattr(self.config.trainer, "freeze_modules"))
-            else None
-        )
-        self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
-
         #  print model trainable parameters:
         self.print_trainable_parameters(self.model)
 
         # initialize distributed training components
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
-            self.accelerator,  # must be the first param
-            self.model,
-            self.optimizer,
-            self.vla_train_dataloader,
-        )
+        if self.vla_val_dataloader is None:
+            self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+                self.accelerator,  # must be the first param
+                self.model,
+                self.optimizer,
+                self.vla_train_dataloader,
+            )
+        else:
+            self.model, self.optimizer, self.vla_train_dataloader, self.vla_val_dataloader = (
+                self.setup_distributed_training(
+                    self.accelerator,  # must be the first param
+                    self.model,
+                    self.optimizer,
+                    self.vla_train_dataloader,
+                    self.vla_val_dataloader,
+                )
+            )
 
         self._init_wandb()
 
@@ -223,7 +246,7 @@ class VLATrainer(TrainerUtils):
                 # Force offline logging whenever wandb is enabled.
                 os.environ["WANDB_MODE"] = "offline"
                 wandb.init(
-                    name=self.config.run_id,
+                    name=Path(self.config.output_dir).name,
                     dir=os.path.join(self.config.output_dir, "wandb"),
                     project=self.config.wandb_project,
                     entity=self.config.wandb_entity,
@@ -413,27 +436,73 @@ class VLATrainer(TrainerUtils):
         :param metric_fn: Function to compute the distance between predicted and ground truth actions.
         :return: Average metric score across the evaluation dataset.
         """
+        if step_metrics is None:
+            step_metrics = {}
 
-        examples = self._get_next_batch()
-        score = 0.0
-        num_samples = len(examples)
-        actions = [example["action"] for example in examples]  # label
-        # Predict actions using the model
-        output_dict = self.model.predict_action(
-            examples=examples, use_ddim=True, num_ddim_steps=20
-        )
+        if self.vla_val_dataloader is None:
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                logger.warning("Validation dataloader is None, skip eval_action_model for this step.")
+            if dist.is_initialized():
+                dist.barrier()
+            return step_metrics
+
+        eval_batches = int(getattr(self.config.trainer, "eval_batches", 50))
+        if eval_batches <= 0:
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                logger.warning(f"`trainer.eval_batches` must be > 0, got {eval_batches}; skip eval.")
+            if dist.is_initialized():
+                dist.barrier()
+            return step_metrics
+
+        eval_model = self.accelerator.unwrap_model(self.model)
+        model_was_training = bool(getattr(eval_model, "training", True))
+        eval_model.eval()
+
+        total_mse = 0.0
+        processed_batches = 0
+        val_iter = iter(self.vla_val_dataloader)
+
+        try:
+            with torch.no_grad():
+                for _ in range(eval_batches):
+                    try:
+                        examples = next(val_iter)
+                    except StopIteration:
+                        break
+
+                    actions = [example["action"] for example in examples]
+                    output_dict = eval_model.predict_action(examples=examples)
+
+                    if self.accelerator.is_main_process:
+                        normalized_actions = output_dict["normalized_actions"]  # B, T, D
+                        if torch.is_tensor(normalized_actions):
+                            normalized_actions = normalized_actions.detach().cpu().numpy()
+                        else:
+                            normalized_actions = np.asarray(normalized_actions)
+
+                        if len(actions) > 0 and torch.is_tensor(actions[0]):
+                            actions = torch.stack([a.detach().cpu() for a in actions], dim=0).numpy()
+                        else:
+                            actions = np.asarray(actions)
+
+                        num_pots = np.prod(actions.shape)
+                        if num_pots > 0:
+                            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
+                            total_mse += float(score / num_pots)
+
+                    processed_batches += 1
+        finally:
+            if model_was_training:
+                eval_model.train()
 
         if self.accelerator.is_main_process:
-            normalized_actions = output_dict["normalized_actions"]  # B, T, D
-            actions = np.array(actions)  # convert actions to numpy.ndarray
-            # B, Chunk, dim = actions.shape
-            num_pots = np.prod(actions.shape)
-            # Compute the metric score
-            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            average_score = score / num_pots
-            step_metrics["mse_score"] = average_score
+            if processed_batches > 0:
+                val_mse_score = total_mse / processed_batches
+                step_metrics["val_mse_score"] = val_mse_score
+                # step_metrics["mse_score"] = val_mse_score
+            else:
+                logger.warning("Validation dataloader yielded 0 batches, skip metric logging for this eval step.")
 
-        del examples
         if dist.is_initialized():
             dist.barrier()  # ensure all processes are synchronized
         return step_metrics
@@ -449,6 +518,8 @@ class VLATrainer(TrainerUtils):
 
     def _train_step(self, batch_vla):
         """execute single training step"""
+        # Guard against mode leakage from eval_action_model().
+        self.model.train()
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 
@@ -512,8 +583,9 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     # build model
     vla = build_framework(cfg)
+    vla = apply_training_freeze_policy(vla, cfg)
     # prepare data
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla_train_dataloader, vla_val_dataloader = prepare_data(cfg=cfg, accelerator=accelerator)
 
     # set optimizer and scheduler
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
@@ -524,6 +596,7 @@ def main(cfg) -> None:
         cfg=cfg,
         model=vla,
         vla_train_dataloader=vla_train_dataloader,
+        vla_val_dataloader=vla_val_dataloader,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,

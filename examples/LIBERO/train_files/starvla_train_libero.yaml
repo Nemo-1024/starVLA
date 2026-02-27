@@ -1,10 +1,9 @@
 run_id: starvla
 run_root_dir: results/Checkpoints
 seed: 42
-# trackers: [jsonl, wandb] # 无效项说明：当前训练脚本没有独立 jsonl tracker，`jsonl` 不会生效
 trackers: [wandb]
-wandb_entity: your_wandb_entity
-wandb_project: llavavla
+wandb_entity: rleai
+wandb_project: finetune-LIBERO
 is_debug: false
 
 
@@ -20,6 +19,7 @@ framework:
     action_dim: 7
     state_dim: 7
     future_action_window_size: 7
+    past_action_window_size: 0
     action_horizon: 8
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
@@ -39,9 +39,8 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
-    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
-    data_mix: libero_all
+    data_root_dir: /mnt/project_rlinf/jlchen/datasets
+    data_mix: libero
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     per_device_batch_size: 16
     video_backend: pyav
@@ -59,7 +58,14 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  freeze_modules: ''
+  freeze:
+    freeze_vision_backbone: false
+    freeze_llm_backbone: false
+    freeze_last_llm_layer: false
+    freeze_embedding: false
+    unfreeze_vision_merger: false
+    unfreeze_llm_last_n_layers: null
+    unfreeze_lam_decoder: false
   logging_frequency: 10
   gradient_clipping: 1.0
 

@@ -48,7 +48,6 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
     data_mix: libero_goal # libero_goal
     action_type: delta_qpos
@@ -66,6 +65,7 @@ trainer:
   num_warmup_steps: 5000
   save_interval: 5000
   eval_interval: 100
+  eval_batches: 50
   learning_rate:
     base: 2.5e-05
     qwen_vl_interface: 1.0e-05

@@ -19,6 +19,9 @@ def lam_collate(batch: Sequence[Dict], max_state_dim: int = 32) -> Dict[str, Any
         delta_proprio: [B,max_state_dim] float32
         embodiment_ids: [B] int64
         proprio_mask: [B,max_state_dim] float32 (compat dim-only mask)
+        dataset_names: list[str] (optional sample provenance)
+        trajectory_ids: list[Union[int, str]] (optional sample provenance)
+        base_indices: [B] int64 (optional sample provenance)
     """
     if len(batch) == 0:
         raise ValueError("lam_collate received an empty batch.")
@@ -59,6 +62,12 @@ def lam_collate(batch: Sequence[Dict], max_state_dim: int = 32) -> Dict[str, Any
         [s["embodiment_id"] for s in batch],
         dtype=torch.long,
     )
+    dataset_names = [str(s.get("dataset_name", "unknown")) for s in batch]
+    trajectory_ids = [s.get("trajectory_id", -1) for s in batch]
+    base_indices = torch.tensor(
+        [int(s.get("base_index", -1)) for s in batch],
+        dtype=torch.long,
+    )
 
     return {
         "videos": videos,
@@ -68,4 +77,7 @@ def lam_collate(batch: Sequence[Dict], max_state_dim: int = 32) -> Dict[str, Any
         "delta_proprio": delta_t,
         "embodiment_ids": embodiment_ids_t,
         "proprio_mask": proprio_mask_t,
+        "dataset_names": dataset_names,
+        "trajectory_ids": trajectory_ids,
+        "base_indices": base_indices,
     }

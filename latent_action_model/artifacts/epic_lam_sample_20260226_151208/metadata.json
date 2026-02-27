@@ -1,0 +1,34 @@
+{
+  "idx": 0,
+  "dataset_name": "epic_kitchens_100_lerobot",
+  "trajectory_id": 30,
+  "base_index": 4890,
+  "video_key": "video.primary_view",
+  "delta_indices": [
+    0,
+    16
+  ],
+  "step_indices": [
+    4890,
+    4906
+  ],
+  "abs_indices": [
+    182128,
+    182144
+  ],
+  "relative_timestamps_sec": [
+    489.0,
+    490.6
+  ],
+  "video_timestamps_sec": [
+    489.0,
+    490.6
+  ],
+  "frame_interval_sec": 1.6000000000000227,
+  "frame_shape": [
+    2,
+    256,
+    256,
+    3
+  ]
+}

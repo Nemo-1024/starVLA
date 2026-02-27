@@ -15,12 +15,9 @@ _workspace_root = Path(__file__).parent.parent.parent.parent
 if str(_workspace_root) not in sys.path:
     sys.path.insert(0, str(_workspace_root))
 
-from typing import List
-from tqdm import tqdm
 from typing import List, Optional, Tuple
+from tqdm import tqdm
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
@@ -78,7 +75,48 @@ class Qwen_GR00T(baseframework):
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
-        
+        # self.use_state = config.framework.action_model.use_state
+    def _stack_tensor_field(
+        self,
+        examples: List[dict],
+        key: str,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        values = [example[key] for example in examples]
+        if not all(torch.is_tensor(v) for v in values):
+            got_types = [type(v).__name__ for v in values]
+            raise TypeError(f"New pipeline expects `{key}` as torch.Tensor per sample, got {got_types}.")
+        stacked = torch.stack(values, dim=0).to(device=device, dtype=dtype, non_blocking=True)
+        if stacked.ndim == 2:
+            stacked = stacked.unsqueeze(1)
+        if stacked.ndim != 3:
+            raise ValueError(f"`{key}` must be [B, T, D] or [B, D], got shape={tuple(stacked.shape)}")
+        return stacked
+
+    def apply_training_freeze_policy(self, freeze_cfg) -> None:
+        # Unified freeze schema is accepted but QwenGR00T keeps all modules trainable.
+        del freeze_cfg
+        freeze_vision_backbone = False
+        freeze_llm_backbone = False
+        freeze_last_llm_layer = False
+        freeze_embedding = False
+        unfreeze_vision_merger = False
+        unfreeze_lam_decoder = False
+        unfreeze_llm_last_n_layers = None
+        _ = (
+            freeze_vision_backbone,
+            freeze_llm_backbone,
+            freeze_last_llm_layer,
+            freeze_embedding,
+            unfreeze_vision_merger,
+            unfreeze_lam_decoder,
+            unfreeze_llm_last_n_layers,
+        )
+
+        for p in self.parameters():
+            p.requires_grad = True
 
     def forward(
         self,
@@ -88,12 +126,10 @@ class Qwen_GR00T(baseframework):
         """
 
         """
-        batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
+        # New data pipeline contract:
+        # examples: List[Dict] with keys image/lang/action/(optional)state
+        batch_images = [example["image"] for example in examples]  # [B, [PIL.Image]]
         instructions = [example["lang"] for example in examples]  # [B, str]
-        actions = [example["action"] for example in examples]  # label [B， len, 7]
-        
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
-        
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
@@ -109,8 +145,11 @@ class Qwen_GR00T(baseframework):
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
-            actions = torch.tensor(
-                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
+            actions = self._stack_tensor_field(
+                examples,
+                "action",
+                device=last_hidden.device,
+                dtype=last_hidden.dtype,
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
 
@@ -121,11 +160,16 @@ class Qwen_GR00T(baseframework):
             last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
             
             state_repeated = None
-            if state is not None:
-                state = torch.tensor(
-                    np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
-                )
-                state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
+            # if "state" in examples[0]:
+            #     if not all("state" in example for example in examples):
+            #         raise ValueError("Inconsistent state presence in batch: some samples miss `state`.")
+            #     state = self._stack_tensor_field(
+            #         examples,
+            #         "state",
+            #         device=last_hidden.device,
+            #         dtype=last_hidden.dtype,
+            #     )
+            #     state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
             action_loss = self.action_model(last_hidden_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
 
@@ -150,10 +194,8 @@ class Qwen_GR00T(baseframework):
         """
         if type(examples) is not list:
             examples = [examples]
-        batch_images = [to_pil_preserve(example["image"]) for example in examples]  #  [B，[PLT]]
+        batch_images = [to_pil_preserve(example["image"]) for example in examples]  # [B, [PIL]]
         instructions = [example["lang"] for example in examples]  # [B, str]
-    
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
         
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
@@ -172,7 +214,16 @@ class Qwen_GR00T(baseframework):
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
 
-        state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
+        state = None
+        if "state" in examples[0]:
+            if not all("state" in example for example in examples):
+                raise ValueError("Inconsistent state presence in batch: some samples miss `state`.")
+            state = self._stack_tensor_field(
+                examples,
+                "state",
+                device=last_hidden.device,
+                dtype=last_hidden.dtype,
+            )
         
         # Step 4: Action Expert Forward
         with torch.autocast("cuda", dtype=torch.float32):

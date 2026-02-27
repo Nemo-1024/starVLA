@@ -40,6 +40,7 @@ def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,
     robot_type: str,
+    mode: str = "train",
     data_cfg: dict | None = None,
 ) -> LeRobotSingleDataset:
     """
@@ -91,6 +92,7 @@ def make_LeRobotSingleDataset(
         modality_configs=modality_config,
         transforms=transforms,
         embodiment_tag=embodiment_tag,
+        mode=mode,
         video_backend=video_backend,
         data_cfg=data_cfg,
     )
@@ -120,7 +122,18 @@ def get_vla_dataset(
 
     dataset_mixture = []
     for d_name, d_weight, robot_type in filtered_mixture_spec:
-        dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, data_cfg=data_cfg), d_weight))
+        dataset_mixture.append(
+            (
+                make_LeRobotSingleDataset(
+                    Path(data_root_dir),
+                    d_name,
+                    robot_type,
+                    mode=mode,
+                    data_cfg=data_cfg,
+                ),
+                d_weight,
+            )
+        )
 
     return LeRobotMixtureDataset(
         dataset_mixture,

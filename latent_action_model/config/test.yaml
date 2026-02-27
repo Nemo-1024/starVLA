@@ -1,0 +1,138 @@
+# VJEPA_LAM 模型配置 - 适配 Lightning CLI
+#
+# 物理接地功能说明：
+# 1. 物理接地状态差解码器默认启用（由模型结构固定提供）
+# 2. 确保数据混合包含机械臂数据集（如 libero, bridge 等）和人类视频数据集（如 ego4d）
+# 3. 模型会自动识别机械臂数据（状态非零）并计算物理接地辅助损失
+# 4. 人类数据的状态在 transforms.py 中已被填充为零，不参与辅助损失计算
+
+seed_everything: 42
+
+  
+# 模型参数
+model:
+  # VJEPA_LAM 模型架构参数
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
+  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
+  dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
+  enc_layers: 24               # LAM 编码器层数 16head
+  ffn_expansion_factor: 4
+  num_heads: 16
+  max_state_dim: 32            # 与 data.max_state_dim 对齐（多数据集 state padding）
+  num_embodiments: 32
+  codebook_size: 32        # 码本大小
+  code_dim: 64                # 码本维度
+  num_queries: 1
+  num_frames: 2
+  image_hw: [256, 256]
+  patch_size: 16
+  image_aug: false
+  dual_view_aug: false
+  dec_layers: 24                # 解码器层数
+  dropout: 0.0                 # Dropout 率              
+  warmup_steps: 5000           # 预热步数；0 表示关闭预热
+  enc_add_state: false
+  enc_modal_mask: true
+  lambda_aux: 1.0                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
+  loss_type: "smooth_l1"
+  state_loss_type: "l2"
+
+  latent_layer_to_use: -2
+  multi_input: false
+  norm_latents: true                 #归一化latents
+  norm_latents_type: "ln"
+  lambda_diversity: 0.0            #0.03与重建损失同一数量级
+  vq_type: "ae"
+  vq_kwargs:
+    layer_norm: true
+
+  project: lam
+  task_name: dino_base_ae_bigwin
+
+
+  wandb_offline: true
+  
+  # 训练参数
+  optimizer: 
+    class_path: torch.optim.AdamW
+    init_args:
+      lr: 1e-4
+      weight_decay: 0.4
+  exclude_bias_norm_from_wd: true
+  
+  # 索引保存参数
+  make_data_pair: false        # 是否生成数据对
+  output_dir: output_pairs     # 输出目录
+
+# 数据参数
+data:
+  # LeRobotDataModule (latent_action_model/data_loader/lerobot_datamodule.py)
+  data_root_dir: "/mnt/project_rlinf/jlchen/datasets"
+  data_mix: "libero"  # lam_plus_human
+  video_backend: "pyav"  # torchcodec is very slow on AgiBot AV1 random-access training
+  num_frames: 2
+  frame_dt_sec: 1.6
+  batch_size: 64
+  # 多卡默认使用更保守的数据加载并发，避免视频解码触发主机内存峰值
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: false
+  persistent_workers: false
+  in_order: false  # 快 worker 先出队，减少周期性卡顿
+  debug_repeat_batch: false
+  max_state_dim: 32
+
+# 训练器参数
+trainer:
+  max_epochs: 40
+  accelerator: gpu
+  devices: auto
+  # strategy: ddp_find_unused_parameters_true
+  strategy: ddp_find_unused_parameters_false
+  accumulate_grad_batches: 1    
+  precision: bf16-mixed            #bf16-mixed 32-true 
+  log_every_n_steps: 1000
+  gradient_clip_val: 1.0
+  # enable_progress_bar: false  # 禁用重复的进度条
+  # 关闭训练期间验证
+  val_check_interval: null
+  num_sanity_val_steps: 0
+  limit_val_batches: 0
+
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        # dirpath: ./logs/vjepa_lam
+        verbose: true
+        save_last: true
+        save_top_k: -1
+        # save_on_train_epoch_end: true    # 每个epoch结束时也保存
+        every_n_epochs: 1
+        # every_n_train_steps: 100
+        filename: "{epoch}"
+        
+
+    - class_path: latent_action_model.core.lam_lightinng.SaveConfigToCheckpointCallback
+
+  logger:
+    - class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: latent_action_model/logs
+        name:  dino_base_ae_bigwin
+
+
+
+
+
+
+    # - class_path: lightning.pytorch.loggers.WandbLogger
+    #   init_args:
+    #     project: UniVLA-latent_action_model
+    #     name: lam
+    #     offline: false
+
+       
+
+        

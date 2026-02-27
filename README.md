@@ -355,12 +355,34 @@ accelerate launch \
 <details close>
 <summary><b>Q: Can I freeze the VLM via parameters?</b></summary>
 
-A: Yes. StarVLA uses a regex / name list to control freezing. Example:
+A: Yes. Use `trainer.freeze` as the unified freeze entry:
+```yaml
+trainer:
+  freeze:
+    freeze_vision_backbone: true
+    freeze_llm_backbone: true
+    freeze_last_llm_layer: true
+    freeze_embedding: true
+    unfreeze_vision_merger: true
+    unfreeze_llm_last_n_layers: 4
+    unfreeze_lam_decoder: true
 ```
---trainer.freeze_modules "qwen_vl_interface.model.model.visual,dino_encoder" \
+`QwenGR00T` keeps this schema but currently treats all freeze flags as `false` (no freezing).
+
+</details>
+
+<details close>
+<summary><b>Q: How should I configure LatentWorld action chunk?</b></summary>
+
+A: Use `framework.action_model` as the only source of truth:
+```yaml
+framework:
+  action_model:
+    future_action_window_size: 7
+    past_action_window_size: 0
+    action_horizon: 8  # must equal future_action_window_size + past_action_window_size + 1
 ```
-Tips: You can ``print(your_model)`` first to check the relative paths of your modules and list them as comma-separated values.
-(implementation in `TrainerUtils.freeze_backbones`.)
+For LatentWorld, `flow_cfg.window_size` is derived internally from `action_horizon` and should not be set manually.
 
 </details>
 

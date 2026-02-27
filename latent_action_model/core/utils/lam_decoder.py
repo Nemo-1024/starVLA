@@ -44,7 +44,7 @@ class LAMDecoder_v2(nn.Module):
         #     dropout=dropout,
         #     batch_first=True,
         # )
-        
+        # self.last_ln = nn.LayerNorm(input_dim)
         # 简化输入输出投影，避免冗余
         if input_dim == context_dim:
             self.project_input = nn.Identity()
@@ -53,9 +53,13 @@ class LAMDecoder_v2(nn.Module):
             self.project_input = nn.Linear(input_dim, context_dim)
             self.project_output = nn.Linear(context_dim, input_dim)
         if code_dim is not None and code_dim != context_dim:
-            self.action_in_proj = nn.Linear(code_dim, context_dim)
+            self.action_in_proj = nn.Sequential(
+                nn.Linear(code_dim, context_dim),
+                nn.LayerNorm(context_dim),
+            )
         else:
-            self.action_in_proj = nn.Identity()
+            # code_dim == context_dim 时也进行归一化，降低异常 latent 的注入冲击。
+            self.action_in_proj = nn.LayerNorm(context_dim)
         if not train_in_latent:
             self.to_pixel = nn.ConvTranspose2d(input_dim, 3, kernel_size=16, stride=16)
         
@@ -102,6 +106,7 @@ class LAMDecoder_v2(nn.Module):
                 x = layer(x)
         # 输出投影
         reconstructed_features = self.project_output(x[:, :features_tokens.shape[1]])  # [B, K, input_dim]
+        # reconstructed_features = self.last_ln(reconstructed_features)
         # 统一返回形状为 [B, 1, K, *]
         if not self.train_in_latent:
             B, K, D = reconstructed_features.shape

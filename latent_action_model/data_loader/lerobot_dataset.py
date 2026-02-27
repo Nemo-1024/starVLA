@@ -252,6 +252,10 @@ class LeRobotLAMDataset(Dataset):
             "frames": frames_t,
             "proprio": proprio,
             "embodiment_id": embodiment_id,
+            # Keep sample provenance for debugging late-step loss spikes.
+            "dataset_name": str(dataset.dataset_name),
+            "trajectory_id": int(traj_id) if isinstance(traj_id, (int, np.integer)) else str(traj_id),
+            "base_index": int(base_index),
         }
 
     def __getitem__(self, index: int) -> Dict:

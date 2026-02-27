@@ -1,7 +1,7 @@
 export NCCL_SOCKET_IFNAME=bond0
 export NCCL_IB_HCA=mlx5_2,mlx5_3
 
-export NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=1000  # timeout set to 1 hour (unit: seconds)
 

@@ -27,8 +27,7 @@ class ModelClient:
         image_size: list[int] = [224, 224],
         action_scale: float = 1.0,
         cfg_scale: float = 1.5,
-        use_ddim: bool = True,
-        num_ddim_steps: int = 10,
+        num_inference_steps: int = 10,
         action_ensemble = True,
         adaptive_ensemble_alpha = 0.1,
         host="0.0.0.0",
@@ -63,8 +62,7 @@ class ModelClient:
         self.unnorm_key = unnorm_key
 
         print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
-        self.use_ddim = use_ddim
-        self.num_ddim_steps = num_ddim_steps
+        self.num_inference_steps = num_inference_steps
 
 
         self.cfg_scale = cfg_scale # 1.5
@@ -140,15 +138,13 @@ class ModelClient:
             "examples": [example],
             "do_sample": False,
             "cfg_scale": self.cfg_scale,
-            "use_ddim": self.use_ddim,
-            "num_ddim_steps": self.num_ddim_steps,
+            "num_inference_steps": self.num_inference_steps,
         }
 
         vla_input = {
             "examples": [example],
             "do_sample": False,
-            "use_ddim": self.use_ddim,
-            "num_ddim_steps": self.num_ddim_steps,
+            "num_inference_steps": self.num_inference_steps,
         }
         
    

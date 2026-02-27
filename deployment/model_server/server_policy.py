@@ -5,9 +5,20 @@
 import logging
 import socket
 import argparse
+from pathlib import Path
 from deployment.model_server.tools.websocket_policy_server import WebsocketPolicyServer
 from starVLA.model.framework.base_framework import baseframework
 import torch, os
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if hasattr(cfg, "get"):
+        try:
+            return cfg.get(key, default)
+        except Exception:
+            pass
+    return getattr(cfg, key, default)
 
 
 def main(args) -> None:
@@ -27,6 +38,13 @@ def main(args) -> None:
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
+    framework_cfg = _cfg_get(getattr(vla, "config", None), "framework", None)
+    framework_name = _cfg_get(framework_cfg, "name", vla.__class__.__name__)
+    metadata = {
+        "env": "simpler_env",
+        "ckpt_path": str(Path(args.ckpt_path).expanduser().resolve()),
+        "framework_name": str(framework_name),
+    }
 
     # start websocket server
     server = WebsocketPolicyServer(
@@ -34,7 +52,7 @@ def main(args) -> None:
         host="0.0.0.0",
         port=args.port,
         idle_timeout=args.idle_timeout,
-        metadata={"env": "simpler_env"},
+        metadata=metadata,
     )
     logging.info("server running ...")
     server.serve_forever()

@@ -28,8 +28,7 @@ class PolicyWarper:
         action_ensemble = False, # @Jinhui
         action_ensemble_horizon: Optional[int] = 3, # different cross sim
         image_size: list[int] = [224, 224],
-        use_ddim: bool = True,
-        num_ddim_steps: int = 10,
+        num_inference_steps: int = 10,
         adaptive_ensemble_alpha = 0.1,
         host="0.0.0.0",
         port=10095,
@@ -42,8 +41,7 @@ class PolicyWarper:
         self.unnorm_key = unnorm_key
 
         print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
-        self.use_ddim = use_ddim
-        self.num_ddim_steps = num_ddim_steps
+        self.num_inference_steps = num_inference_steps
         self.image_size = image_size
         self.horizon = horizon #0
         self.action_ensemble = action_ensemble
@@ -137,8 +135,7 @@ class PolicyWarper:
         vla_input = {
             "examples": examples,
             "do_sample": False,
-            "use_ddim": self.use_ddim,
-            "num_ddim_steps": self.num_ddim_steps,
+            "num_inference_steps": self.num_inference_steps,
         }
         
         response = self.client.predict_action(vla_input)

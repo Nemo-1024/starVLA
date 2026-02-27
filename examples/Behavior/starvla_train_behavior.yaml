@@ -47,7 +47,6 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/behavior-1k
     data_mix: BEHAVIOR_challenge
     include_state: false
@@ -71,7 +70,14 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  freeze_modules: ''
+  freeze:
+    freeze_vision_backbone: false
+    freeze_llm_backbone: false
+    freeze_last_llm_layer: false
+    freeze_embedding: false
+    unfreeze_vision_merger: false
+    unfreeze_llm_last_n_layers: null
+    unfreeze_lam_decoder: false
   repeated_diffusion_steps: 4
   max_grad_norm: 1.0
   warmup_ratio: 0.1

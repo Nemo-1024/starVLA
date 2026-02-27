@@ -44,7 +44,6 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/RoboTwin
     data_mix: robotwin # bridge_rt_1
     action_type: abs_qpos

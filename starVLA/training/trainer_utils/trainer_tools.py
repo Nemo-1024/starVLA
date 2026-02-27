@@ -64,24 +64,8 @@ def build_param_lr_groups(model, cfg):
     lr_cfg = cfg.trainer.learning_rate
     base_lr = lr_cfg.get("base", 1e-4)  # default base learning rate
 
-    freeze_modules = cfg.trainer.get("freeze_modules", "")
-    if not isinstance(freeze_modules, str):
-        freeze_modules = ""
-    freeze_patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()]
-
     used_params = set()
-    frozen_params = set()
     param_groups = []
-
-    for freeze_path in freeze_patterns:
-        module = model
-        try:
-            for attr in freeze_path.split("."):
-                module = getattr(module, attr)
-            frozen_params.update(id(p) for p in module.parameters())
-        except AttributeError:
-            print(f"⚠️ freeze module path does not exist: {freeze_path}")
-            continue
 
     for module_name, lr in lr_cfg.items():
         if module_name == "base":
@@ -91,20 +75,43 @@ def build_param_lr_groups(model, cfg):
         try:
             for attr in module_name.split("."):
                 module = getattr(module, attr)
-            # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
+            params = []
+            for p in module.parameters():
+                pid = id(p)
+                if not p.requires_grad or pid in used_params:
+                    continue
+                params.append(p)
+                used_params.add(pid)
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
-                used_params.update(id(p) for p in params)
         except AttributeError:
-            ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
+            logger.warning(f"module path `{module_name}` not found in model; skip custom lr group")
 
-    # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
+    # assign base learning rate to remaining trainable parameters
+    other_params = []
+    for p in model.parameters():
+        pid = id(p)
+        if not p.requires_grad or pid in used_params:
+            continue
+        other_params.append(p)
+        used_params.add(pid)
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
 
+    if not param_groups:
+        raise ValueError("No trainable parameters found when building optimizer parameter groups.")
+
     return param_groups
+
+
+def apply_training_freeze_policy(model, cfg):
+    trainer_cfg = getattr(cfg, "trainer", None)
+    freeze_cfg = getattr(trainer_cfg, "freeze", None) if trainer_cfg is not None else None
+
+    freeze_fn = getattr(model, "apply_training_freeze_policy", None)
+    if callable(freeze_fn):
+        freeze_fn(freeze_cfg)
+    return model
 
 
 import torch.distributed as dist
@@ -402,7 +409,7 @@ class TrainerUtils:
 
             # model prediction
             predicted_solutions, normalized_actions = qwenpi.predict_action_withCoT(
-                images=images, instructions=instructions, use_ddim=False, num_ddim_steps=20
+                images=images, instructions=instructions
             )
 
             # extract and convert predicted results

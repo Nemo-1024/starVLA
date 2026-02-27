@@ -46,7 +46,6 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: lerobot_datasets
     data_root_dir: playground/Datasets/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim
     data_mix: fourier_gr1_unified_1000 # bridge_rt_1
     action_type: delta_ee
