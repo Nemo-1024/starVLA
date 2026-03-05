@@ -60,6 +60,16 @@ class LatentWorldPolicyConfig:
     enable_wrist_view: bool = False
     # Flow-only 梯度模式：仅允许 flow placeholder 位置的 VLM hidden 接收 flow loss 梯度
     flow_only_mode: bool = False
+    # 是否启用 flow future feature 的 scheduled sampling。
+    # False: 始终使用 h_t1_pred。
+    # True: 训练早期偏向 h_t1_gt，随后线性提高 h_t1_pred 采样概率。
+    enable_flow_h_t1_scheduled_sampling: bool = False
+    flow_h_t1_pred_prob_start: float = 0.0
+    flow_h_t1_pred_prob_end: float = 1.0
+    flow_h_t1_pred_ramp_steps: int = 20000
+    # True 时切断 flow 与 LAM decoder 的 future feature 梯度；
+    # False 时总是允许梯度传递（GT 分支通过 straight-through bridge）。
+    detach_future_feature: bool = False
 
     # Independent additions
     num_action_queries: int = 8
@@ -295,6 +305,12 @@ class LatentWorldPolicyBackend(nn.Module):
 
         # 5) Flow head.
         self.flow = ConditionalFlowMatchingHead(config=self.model_cfg.flow_cfg)
+        self._flow_train_step: int = 0
+        if bool(self.model_cfg.enable_flow_h_t1_scheduled_sampling) and not bool(self.model_cfg.detach_future_feature):
+            print(
+                "[LatentWorldPolicyBackend][warn] enable_flow_h_t1_scheduled_sampling=true and "
+                "detach_future_feature=false: flow gradients through GT-conditioned branch can increase loss_perceptual."
+            )
 
     def _init_lam_from_cfg(self) -> nn.Module:
         lam = load_latent_action_model(self.model_cfg.lam_ckpt_path, self.model_cfg.lam_yaml_path)
@@ -395,29 +411,29 @@ class LatentWorldPolicyBackend(nn.Module):
             "vlm_out": vlm_out,
         }
 
-    def _build_lam_teacher_inputs_for_distill(self, lam_videos: torch.Tensor) -> torch.Tensor:
+    def _build_lam_teacher_inputs_for_distill(self, primary_video: torch.Tensor) -> torch.Tensor:
         expected_t = int(getattr(getattr(self.lam, "encoder", None), "num_frames", 0) or 0)
         if expected_t <= 0:
-            return lam_videos
+            return primary_video
 
-        cur_t = int(lam_videos.shape[1])
+        cur_t = int(primary_video.shape[1])
         if cur_t == expected_t:
-            return lam_videos
+            return primary_video
         if cur_t < expected_t:
             raise ValueError(
                 f"[LatentWorldPolicyBackend] distill teacher temporal mismatch: got T={cur_t}, "
                 f"but LAM encoder expects num_frames={expected_t}."
             )
-        idx = torch.linspace(0, cur_t - 1, steps=expected_t, device=lam_videos.device).round().long()
-        return lam_videos.index_select(1, idx)
+        idx = torch.linspace(0, cur_t - 1, steps=expected_t, device=primary_video.device).round().long()
+        return primary_video.index_select(1, idx)
 
-    def _run_lam_teacher(self, *, lam_videos: torch.Tensor, embodiment_id: torch.Tensor) -> torch.Tensor:
-        lam_videos_t = self._build_lam_teacher_inputs_for_distill(lam_videos)
+    def _run_lam_teacher(self, *, primary_video: torch.Tensor, embodiment_id: torch.Tensor) -> torch.Tensor:
+        primary_video_t = self._build_lam_teacher_inputs_for_distill(primary_video)
         with torch.no_grad():
             lam_out = self.lam.get_latent_action(
-                videos=lam_videos_t,
+                videos=primary_video_t,
                 states=None,
-                dec_videos=lam_videos_t,
+                dec_videos=primary_video_t,
                 predict_future_frame=False,
                 embodiment_ids=embodiment_id,
             )
@@ -443,10 +459,10 @@ class LatentWorldPolicyBackend(nn.Module):
         self,
         *,
         pred_latent: torch.Tensor,
-        lam_videos: torch.Tensor,
+        primary_video: torch.Tensor,
         embodiment_id: torch.Tensor,
     ) -> torch.Tensor:
-        teacher_latent = self._run_lam_teacher(lam_videos=lam_videos, embodiment_id=embodiment_id)
+        teacher_latent = self._run_lam_teacher(primary_video=primary_video, embodiment_id=embodiment_id)
         return self._compute_latent_loss(
             pred_latent=pred_latent,
             teacher_latent=teacher_latent,
@@ -500,6 +516,48 @@ class LatentWorldPolicyBackend(nn.Module):
             else:
                 child.eval()
 
+    def set_flow_train_step(self, step: int) -> None:
+        self._flow_train_step = max(0, int(step))
+
+    def _flow_h_t1_pred_prob(self) -> float:
+        if not bool(self.model_cfg.enable_flow_h_t1_scheduled_sampling):
+            return 1.0
+        start = float(self.model_cfg.flow_h_t1_pred_prob_start)
+        end = float(self.model_cfg.flow_h_t1_pred_prob_end)
+        ramp_steps = max(1, int(self.model_cfg.flow_h_t1_pred_ramp_steps))
+        ratio = min(1.0, float(self._flow_train_step) / float(ramp_steps))
+        prob = start + (end - start) * ratio
+        return float(max(0.0, min(1.0, prob)))
+
+    def _build_flow_future_condition(
+        self,
+        *,
+        h_t1_pred: torch.Tensor,
+        h_t1_gt: torch.Tensor,
+    ) -> torch.Tensor:
+        if h_t1_pred.shape != h_t1_gt.shape:
+            raise ValueError(
+                f"[LatentWorldPolicyBackend] h_t1 shape mismatch: pred={tuple(h_t1_pred.shape)}, gt={tuple(h_t1_gt.shape)}"
+            )
+
+        if not self.training:
+            return h_t1_pred
+
+        prob_pred = self._flow_h_t1_pred_prob()
+        bsz = int(h_t1_pred.shape[0])
+        pred_mask = (torch.rand(bsz, 1, 1, device=h_t1_pred.device) < prob_pred)
+        cond_future = torch.where(pred_mask, h_t1_pred, h_t1_gt)
+
+        if not bool(self.model_cfg.detach_future_feature):
+            gt_mask = (~pred_mask).to(dtype=h_t1_pred.dtype)
+            # Straight-through bridge:
+            # forward 值不变（+0），backward 为 gt 分支注入来自 h_t1_pred 的梯度。
+            cond_future = cond_future + gt_mask * (h_t1_pred - h_t1_pred.detach())
+        else:
+            cond_future = cond_future.detach()
+
+        return cond_future
+
     # ------------------
     # Checkpoint IO
     # ------------------
@@ -532,41 +590,55 @@ class LatentWorldPolicyBackend(nn.Module):
         flow_query = flow_query.to(device=device, dtype=vlm_embed_dtype)
         return act_query, flow_query
 
-    def _prepare_batch(
-        self,
-        *,
-        batch: Union[LatentWorldPolicyInferBatch, LatentWorldPolicyTrainBatch],
-        include_actions: bool,
-    ) -> Union[LatentWorldPolicyInferBatch, LatentWorldPolicyTrainBatch]:
+    def _prepare_train_batch(self, *, batch: LatentWorldPolicyTrainBatch) -> LatentWorldPolicyTrainBatch:
         device = next(self.parameters()).device
-        infer_keys = (
+        keys = (
             "pixel_values",
             "input_ids",
             "attention_mask",
             "act_placeholder_mask",
             "flow_placeholder_mask",
-            "lam_videos",
+            "primary_video",
             "state",
             "state_mask",
             "embodiment_id",
+            "action_hz",
             "image_grid_thw",
-            "wrist_videos",
+            "actions",
+            "actions_mask",
         )
         prepared: Dict[str, Optional[torch.Tensor]] = {}
-        for key in infer_keys:
+        for key in keys:
             value = batch[key]
             prepared[key] = value.to(device=device) if value is not None else None
-        if include_actions:
-            train_batch = cast(LatentWorldPolicyTrainBatch, batch)
-            prepared["actions"] = train_batch["actions"].to(device=device)
-            prepared["actions_mask"] = train_batch["actions_mask"].to(device=device)
-            return cast(LatentWorldPolicyTrainBatch, prepared)
+        return cast(LatentWorldPolicyTrainBatch, prepared)
+
+    def _prepare_infer_batch(self, *, batch: LatentWorldPolicyInferBatch) -> LatentWorldPolicyInferBatch:
+        device = next(self.parameters()).device
+        keys = (
+            "pixel_values",
+            "input_ids",
+            "attention_mask",
+            "act_placeholder_mask",
+            "flow_placeholder_mask",
+            "primary_image",
+            "state",
+            "state_mask",
+            "embodiment_id",
+            "action_hz",
+            "image_grid_thw",
+        )
+        prepared: Dict[str, Optional[torch.Tensor]] = {}
+        for key in keys:
+            value = batch[key]
+            prepared[key] = value.to(device=device) if value is not None else None
         return cast(LatentWorldPolicyInferBatch, prepared)
 
-    def _run_shared_encoding(
+    def _run_shared_encoding_core(
         self,
         *,
-        prepared_batch: LatentWorldPolicyInferBatch,
+        prepared_batch: Union[LatentWorldPolicyInferBatch, LatentWorldPolicyTrainBatch],
+        primary_visual_input: torch.Tensor,
         source: str,
         lam_features_with_no_grad: bool,
     ) -> PolicyEncodingState:
@@ -593,9 +665,9 @@ class LatentWorldPolicyBackend(nn.Module):
         with _cuda_autocast(lam_stage_dtype):
             if lam_features_with_no_grad:
                 with torch.no_grad():
-                    features = self.lam.extract_vision_features(prepared_batch["lam_videos"])
+                    features = self.lam.extract_vision_features(primary_visual_input)
             else:
-                features = self.lam.extract_vision_features(prepared_batch["lam_videos"])
+                features = self.lam.extract_vision_features(primary_visual_input)
 
             if features is None:
                 raise ValueError(f"[{source}] lam visual feature extraction returned None; check LAM config.")
@@ -612,21 +684,6 @@ class LatentWorldPolicyBackend(nn.Module):
             else:
                 h_t1_pred = h_t
 
-            if self.model_cfg.enable_wrist_view:
-                if prepared_batch["wrist_videos"] is None:
-                    raise ValueError(
-                        f"[{source}] `enable_wrist_view=true` requires non-empty `wrist_videos` in the prepared batch."
-                    )
-                if lam_features_with_no_grad:
-                    with torch.no_grad():
-                        features_w = self.lam.extract_vision_features(prepared_batch["wrist_videos"])
-                else:
-                    features_w = self.lam.extract_vision_features(prepared_batch["wrist_videos"])
-                if features_w is None:
-                    raise ValueError(f"[{source}] wrist visual feature extraction returned None.")
-                h_t_w = features_w[:, 0, :, :]
-                h_t = torch.cat([h_t_w, h_t], dim=1)
-
         return PolicyEncodingState(
             h_vlm=h_vlm,
             pred_action_emb=pred_action_emb,
@@ -634,6 +691,34 @@ class LatentWorldPolicyBackend(nn.Module):
             h_t1_pred=h_t1_pred,
             h_t1_gt=h_t1_gt,
             h_t_original=h_t_original,
+        )
+
+    def _run_shared_encoding_train(
+        self,
+        *,
+        prepared_batch: LatentWorldPolicyTrainBatch,
+        source: str,
+        lam_features_with_no_grad: bool,
+    ) -> PolicyEncodingState:
+        return self._run_shared_encoding_core(
+            prepared_batch=prepared_batch,
+            primary_visual_input=prepared_batch["primary_video"],
+            source=source,
+            lam_features_with_no_grad=lam_features_with_no_grad,
+        )
+
+    def _run_shared_encoding_infer(
+        self,
+        *,
+        prepared_batch: LatentWorldPolicyInferBatch,
+        source: str,
+        lam_features_with_no_grad: bool,
+    ) -> PolicyEncodingState:
+        return self._run_shared_encoding_core(
+            prepared_batch=prepared_batch,
+            primary_visual_input=prepared_batch["primary_image"],
+            source=source,
+            lam_features_with_no_grad=lam_features_with_no_grad,
         )
 
     def forward(
@@ -649,12 +734,11 @@ class LatentWorldPolicyBackend(nn.Module):
         flow_stage_dtype = torch.float32
         prepared_batch = cast(
             LatentWorldPolicyTrainBatch,
-            self._prepare_batch(batch=batch, include_actions=True),
+            self._prepare_train_batch(batch=batch),
         )
         device = prepared_batch["input_ids"].device
-        expected_horizon = int(self.model_cfg.action_horizon)
 
-        shared = self._run_shared_encoding(
+        shared = self._run_shared_encoding_train(
             prepared_batch=prepared_batch,
             source="LatentWorldPolicyBackend.forward",
             lam_features_with_no_grad=True,
@@ -665,7 +749,7 @@ class LatentWorldPolicyBackend(nn.Module):
             if bool(self.model_cfg.enable_loss_distill):
                 loss_distill = self._compute_distill_loss(
                     pred_latent=shared.pred_action_emb,
-                    lam_videos=prepared_batch["lam_videos"],
+                    primary_video=prepared_batch["primary_video"],
                     embodiment_id=prepared_batch["embodiment_id"],
                 )
 
@@ -684,23 +768,37 @@ class LatentWorldPolicyBackend(nn.Module):
         with _cuda_autocast(flow_stage_dtype):
             repeat_steps = int(self.model_cfg.repeated_diffusion_steps)
             h_t_rep = shared.h_t.repeat(repeat_steps, *([1] * (shared.h_t.ndim - 1)))
-            h_t1_rep = shared.h_t1_pred.repeat(repeat_steps, *([1] * (shared.h_t1_pred.ndim - 1)))
+            h_t1_pred_rep = shared.h_t1_pred.repeat(repeat_steps, *([1] * (shared.h_t1_pred.ndim - 1)))
+            h_t1_gt_rep = shared.h_t1_gt.repeat(repeat_steps, *([1] * (shared.h_t1_gt.ndim - 1)))
+            h_t1_cond_rep = self._build_flow_future_condition(
+                h_t1_pred=h_t1_pred_rep,
+                h_t1_gt=h_t1_gt_rep,
+            )
             h_vlm_rep = h_vlm_for_flow.repeat(repeat_steps, *([1] * (h_vlm_for_flow.ndim - 1)))
             state_rep = prepared_batch["state"].repeat(repeat_steps, *([1] * (prepared_batch["state"].ndim - 1)))
+            state_mask_rep = prepared_batch["state_mask"].repeat(
+                repeat_steps, *([1] * (prepared_batch["state_mask"].ndim - 1))
+            )
             actions_rep = prepared_batch["actions"].repeat(
                 repeat_steps, *([1] * (prepared_batch["actions"].ndim - 1))
             )
+            actions_mask_rep = prepared_batch["actions_mask"].repeat(
+                repeat_steps, *([1] * (prepared_batch["actions_mask"].ndim - 1))
+            )
+            action_hz_rep = prepared_batch["action_hz"].repeat(repeat_steps)
             embodiment_rep = prepared_batch["embodiment_id"].repeat(repeat_steps)
             attn_rep = attn_flow.repeat(repeat_steps, *([1] * (attn_flow.ndim - 1)))
 
             loss_flow = self.flow(
                 h_t=h_t_rep,
-                h_t1_star=h_t1_rep.detach().clone(),
+                h_t1_star=h_t1_cond_rep,
                 h_vlm=h_vlm_rep,
                 state=state_rep,
                 actions=actions_rep,
+                action_hz=action_hz_rep,
                 embodiment_id=embodiment_rep,
-                action_horizon=expected_horizon,
+                state_mask=state_mask_rep,
+                actions_mask=actions_mask_rep,
                 attention_mask=attn_rep,
             )
 
@@ -731,7 +829,7 @@ class LatentWorldPolicyBackend(nn.Module):
         flow_stage_dtype = torch.float32
         prepared_batch = cast(
             LatentWorldPolicyInferBatch,
-            self._prepare_batch(batch=batch, include_actions=False),
+            self._prepare_infer_batch(batch=batch),
         )
 
         if guidance_scale is None:
@@ -739,7 +837,7 @@ class LatentWorldPolicyBackend(nn.Module):
         if num_inference_steps is None:
             num_inference_steps = int(self.flow.config.num_inference_steps)
 
-        shared = self._run_shared_encoding(
+        shared = self._run_shared_encoding_infer(
             prepared_batch=prepared_batch,
             source="LatentWorldPolicyBackend.predict_action",
             lam_features_with_no_grad=False,
@@ -752,11 +850,12 @@ class LatentWorldPolicyBackend(nn.Module):
                 h_t1_star=shared.h_t1_pred,
                 h_vlm=shared.h_vlm,
                 state=prepared_batch["state"],
-                action_horizon=int(self.model_cfg.action_horizon),
+                action_hz=prepared_batch["action_hz"],
                 embodiment_id=prepared_batch["embodiment_id"],
                 cfg_scale=guidance_scale,
                 num_inference_steps=num_inference_steps,
                 attention_mask=attn_flow,
+                max_action_horizon=int(self.model_cfg.action_horizon),
             )
 
         if not return_intermediates:

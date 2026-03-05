@@ -16,10 +16,10 @@ model:
   vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
-  dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
-  enc_layers: 24               # LAM 编码器层数 16head
-  ffn_expansion_factor: 4
-  num_heads: 16
+  dim: 768                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
+  enc_layers: 12               # LAM 编码器层数 16head
+  ffn_expansion_factor: 3
+  num_heads: 12
   max_state_dim: 32            # 与 data.max_state_dim 对齐（多数据集 state padding）
   num_embodiments: 32
   codebook_size: 32        # 码本大小
@@ -30,7 +30,7 @@ model:
   patch_size: 16
   image_aug: false
   dual_view_aug: false
-  dec_layers: 24                # 解码器层数
+  dec_layers: 6                # 解码器层数
   dropout: 0.0                 # Dropout 率              
   warmup_steps: 5000           # 预热步数；0 表示关闭预热
   enc_add_state: false
@@ -83,6 +83,7 @@ data:
   in_order: false  # 快 worker 先出队，减少周期性卡顿
   debug_repeat_batch: false
   max_state_dim: 32
+  val_tail_ratio: 0.01
 
 # 训练器参数
 trainer:
@@ -96,10 +97,10 @@ trainer:
   log_every_n_steps: 1000
   gradient_clip_val: 1.0
   # enable_progress_bar: false  # 禁用重复的进度条
-  # 关闭训练期间验证
-  val_check_interval: null
+  # 启用每个 epoch 的验证
+  val_check_interval: 1.0
   num_sanity_val_steps: 0
-  limit_val_batches: 0
+  limit_val_batches: 1.0
 
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint

@@ -1,6 +1,11 @@
-from .batch_builder import LatentWorldPolicyBatchBuilder
+from .batch_builder import LatentWorldPolicyInferBatchBuilder, LatentWorldPolicyTrainBatchBuilder
 from .runtime import LatentWorldPolicyComponents, build_policy_components
-from .types import LiberoExample, LatentWorldPolicyInferBatch, LatentWorldPolicyTrainBatch
+from .types import (
+    LatentWorldPolicyInferBatch,
+    LatentWorldPolicyInferExample,
+    LatentWorldPolicyTrainBatch,
+    LatentWorldPolicyTrainExample,
+)
 from .vlm_adapter import LatentWorldPolicyVLMAdapter
 
 
@@ -13,12 +18,14 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "LiberoExample",
-    "LatentWorldPolicyBatchBuilder",
+    "LatentWorldPolicyInferBatch",
+    "LatentWorldPolicyInferBatchBuilder",
+    "LatentWorldPolicyInferExample",
     "LatentWorldPolicyComponents",
     "LatentWorldPolicyConfigBuilder",
-    "LatentWorldPolicyInferBatch",
     "LatentWorldPolicyTrainBatch",
+    "LatentWorldPolicyTrainBatchBuilder",
+    "LatentWorldPolicyTrainExample",
     "LatentWorldPolicyVLMAdapter",
     "build_policy_components",
 ]

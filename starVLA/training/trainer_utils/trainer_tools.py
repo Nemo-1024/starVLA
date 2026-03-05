@@ -6,6 +6,7 @@ endpoints (e.g., JSONL local logs, Weights & Biases).
 """
 
 from typing import Tuple
+from numbers import Number
 import re
 import json
 import numpy as np
@@ -53,6 +54,18 @@ def build_param_lr_groups(model, cfg):
     build multiple param groups based on cfg.trainer.learning_rate.
     support specifying different learning rates for different modules, the rest use base.
 
+    Supported configs:
+      1) Legacy single-module syntax:
+         learning_rate:
+           base: 1e-4
+           qwen_vl_interface: 1e-5
+      2) Named group syntax (one group can contain multiple modules):
+         learning_rate:
+           base: 1e-4
+           pretrained:
+             lr: 1e-5
+             modules: [policy_backend.vlm, policy_backend.lam.decoder]
+
     Args:
         vla: nn.Module model object
         cfg: config object, requires cfg.trainer.learning_rate dictionary
@@ -67,25 +80,69 @@ def build_param_lr_groups(model, cfg):
     used_params = set()
     param_groups = []
 
-    for module_name, lr in lr_cfg.items():
-        if module_name == "base":
+    for group_name, group_spec in lr_cfg.items():
+        if group_name == "base":
             continue
-        # try to find the module under vla by module_name (support nested paths)
-        module = model
-        try:
-            for attr in module_name.split("."):
-                module = getattr(module, attr)
-            params = []
-            for p in module.parameters():
-                pid = id(p)
-                if not p.requires_grad or pid in used_params:
+
+        # Backward-compatible form: module_path: lr
+        if isinstance(group_spec, Number):
+            group_lr = float(group_spec)
+            module_paths = [str(group_name)]
+        else:
+            # New form: group_name: {lr: <float>, modules: [path1, path2, ...]}
+            if not hasattr(group_spec, "get"):
+                logger.warning(
+                    f"learning_rate group `{group_name}` has invalid spec `{group_spec}`; skip custom lr group"
+                )
+                continue
+            group_lr = group_spec.get("lr", None)
+            raw_modules = group_spec.get("modules", None)
+            if group_lr is None or raw_modules is None:
+                logger.warning(
+                    f"learning_rate group `{group_name}` requires both `lr` and `modules`; skip custom lr group"
+                )
+                continue
+            try:
+                group_lr = float(group_lr)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"learning_rate group `{group_name}` has non-numeric lr `{group_lr}`; skip custom lr group"
+                )
+                continue
+            if isinstance(raw_modules, str):
+                module_paths = [raw_modules]
+            else:
+                try:
+                    module_paths = [str(path) for path in raw_modules]
+                except TypeError:
+                    logger.warning(
+                        f"learning_rate group `{group_name}` has non-iterable modules `{raw_modules}`; skip custom lr group"
+                    )
                     continue
-                params.append(p)
-                used_params.add(pid)
-            if params:  # only add param group if there are trainable parameters
-                param_groups.append({"params": params, "lr": lr, "name": module_name})
-        except AttributeError:
-            logger.warning(f"module path `{module_name}` not found in model; skip custom lr group")
+
+        if len(module_paths) == 0:
+            logger.warning(f"learning_rate group `{group_name}` has empty modules; skip custom lr group")
+            continue
+
+        params = []
+        for module_path in module_paths:
+            # try to find the module under model by module_path (support nested paths)
+            module = model
+            try:
+                for attr in str(module_path).split("."):
+                    module = getattr(module, attr)
+                for p in module.parameters():
+                    pid = id(p)
+                    if not p.requires_grad or pid in used_params:
+                        continue
+                    params.append(p)
+                    used_params.add(pid)
+            except AttributeError:
+                logger.warning(f"module path `{module_path}` not found in model; skip this module in group `{group_name}`")
+
+        # only add param group if there are trainable parameters
+        if params:
+            param_groups.append({"params": params, "lr": group_lr, "name": str(group_name)})
 
     # assign base learning rate to remaining trainable parameters
     other_params = []

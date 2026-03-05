@@ -66,16 +66,25 @@ class EmbodimentTag(Enum):
     """
     Human first-person egocentric embodiment.
     """
+    LIBERO = 'libero'
+    """
+    The Libero dataset.
+    """
+    EGODEX = 'egodex'
+    """
+    The EgoDex dataset.
+    """
 # Embodiment tag string: to projector index in the Action Expert Module
 EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.HUMAN.value: 0,
     EmbodimentTag.NEW_EMBODIMENT.value: 31,
     EmbodimentTag.OXE_DROID.value: 17,
+    EmbodimentTag.LIBERO.value: 25,
     EmbodimentTag.OXE_BRIDGE.value: 18,
     EmbodimentTag.OXE_RT1.value: 19,
     EmbodimentTag.AGIBOT_GENIE1.value: 26,
     EmbodimentTag.GR1.value: 24,
-    EmbodimentTag.FRANKA.value: 25,
+    EmbodimentTag.FRANKA.value: 16,
     EmbodimentTag.AGILEX.value: 1,
     EmbodimentTag.FRANKA_FR3_DUAL.value: 2,
     EmbodimentTag.UR.value: 3,
@@ -83,8 +92,8 @@ EMBODIMENT_TAG_MAPPING = {
 
 # Robot type to embodiment tag mapping
 ROBOT_TYPE_TO_EMBODIMENT_TAG = {
-    "libero_franka": EmbodimentTag.FRANKA,
-    "droid": EmbodimentTag.OXE_DROID,
+    "libero_franka": EmbodimentTag.LIBERO,
+    "droid": EmbodimentTag.FRANKA,
     "bridge": EmbodimentTag.OXE_BRIDGE,
     "oxe_rt1": EmbodimentTag.OXE_RT1,
     "fractal": EmbodimentTag.OXE_RT1,

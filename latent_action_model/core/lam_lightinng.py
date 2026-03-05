@@ -536,6 +536,8 @@ class VJEPA_LAM(LightningModule):
         if not isinstance(batch, dict) or "videos" not in batch:
             return batch
 
+        # 验证时 self.training=False，故 training_aug=False，走 eval 增强（仅 Resize+CenterCrop）；
+        # 训练时走 RandomResizedCrop+ColorJitter。eval 样本未做强增强，输入更简单，val/recon_loss 可能天然低于 train/recon_loss。
         training_aug = bool(self.training) and self.image_aug
         videos = batch["videos"]
 
@@ -816,7 +818,11 @@ class VJEPA_LAM(LightningModule):
     
     @torch.no_grad()
     def validation_step(self, batch: Dict, batch_idx: int) -> Tensor:
-        """验证步骤 - 采用推理模式，避免对数据管线新增依赖"""
+        """验证步骤 - 采用推理模式，避免对数据管线新增依赖。
+
+        注意：(1) val 的 total_loss 仅含 recon（entropy/vq 为 0），与 train 的 total 不可直接比较；
+        (2) 验证时未做强数据增强（仅 Resize+CenterCrop），样本更简单，val/recon_loss 可能低于 train/recon_loss。
+        """
         loss, aux_losses = self.shared_inference_step(batch)
         # 记录验证损失（建议仅在 epoch 级聚合，减少日志量）
         self.log_dict(

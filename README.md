@@ -397,6 +397,17 @@ trainer:
     qwen_vl_interface: 1.0e-05
     action_model: 1.0e-04
 ```
+You can also define a named group with multiple module paths:
+```yaml
+trainer:
+  learning_rate:
+    base: 1.0e-4
+    pretrained:
+      lr: 1.0e-5
+      modules:
+        - policy_backend.vlm
+        - policy_backend.lam.decoder
+```
 (Also referenced in `trainer_tools.build_param_lr_groups`.)
 </details>
 

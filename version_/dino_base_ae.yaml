@@ -74,8 +74,7 @@ data:
   video_backend: "pyav"  # torchcodec is very slow on AgiBot AV1 random-access training
   num_frames: 2
   frame_dt_sec: 1.6
-  human_frame_dt_sec: 0.4
-  batch_size: 64
+  batch_size: 128
   # 多卡默认使用更保守的数据加载并发，避免视频解码触发主机内存峰值
   num_workers: 6
   prefetch_factor: 4
@@ -83,7 +82,8 @@ data:
   persistent_workers: false
   in_order: false  # 快 worker 先出队，减少周期性卡顿
   debug_repeat_batch: false
-  max_state_dim: 14
+  max_state_dim: 32
+  val_tail_ratio: 0.01
 
 # 训练器参数
 trainer:

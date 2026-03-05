@@ -20,7 +20,10 @@ from starVLA.dataloader.gr00t_lerobot.datasets import (
     ModalityConfig,
 )
 from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
-from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG
+from starVLA.dataloader.gr00t_lerobot.embodiment_tags import (
+    EmbodimentTag,
+    ROBOT_TYPE_TO_EMBODIMENT_TAG,
+)
 
 
 def _build_modality_config(
@@ -95,11 +98,14 @@ class LeRobotLAMDataset(Dataset):
         data_root_dir: str | Path,
         data_mix: str,
         num_frames: int,
+        mode: str = "train",
+        val_tail_ratio: float = 0.01,
         video_backend: str = "pyav",
         preferred_video_key: Optional[str] = None,
         state_keys: Optional[Sequence[str]] = None,
         *,
         frame_dt_sec: float,
+        human_frame_dt_sec: Optional[float] = None,
         max_retries: int = 5,
         debug_repeat_batch: Union[bool, int] = False,
     ) -> None:
@@ -108,13 +114,29 @@ class LeRobotLAMDataset(Dataset):
             raise ValueError(f"num_frames must be >= 1, got {num_frames}")
         if frame_dt_sec <= 0:
             raise ValueError(f"frame_dt_sec must be > 0, got {frame_dt_sec}")
+        if human_frame_dt_sec is not None and human_frame_dt_sec <= 0:
+            raise ValueError(
+                f"human_frame_dt_sec must be > 0 when provided, got {human_frame_dt_sec}"
+            )
+        normalized_mode = str(mode).lower()
+        if normalized_mode not in {"train", "val", "test", "all"}:
+            raise ValueError(
+                f"Unsupported mode `{mode}`. Expected one of ['train', 'val', 'test', 'all']."
+            )
+        if not (0.0 <= float(val_tail_ratio) < 1.0):
+            raise ValueError(
+                f"val_tail_ratio must be in [0.0, 1.0), got {val_tail_ratio}"
+            )
 
         self.data_root_dir = Path(data_root_dir)
         self.data_mix = data_mix
         self.num_frames = num_frames
+        self.mode = normalized_mode
+        self.val_tail_ratio = float(val_tail_ratio)
         self.preferred_video_key = preferred_video_key
         self.state_keys = list(state_keys) if state_keys else None
         self.frame_dt_sec = frame_dt_sec
+        self.human_frame_dt_sec = human_frame_dt_sec
         self.max_retries = max_retries
 
         # "auto" 选择在不同环境里更稳健：
@@ -167,6 +189,8 @@ class LeRobotLAMDataset(Dataset):
                 dataset_path=self.data_root_dir / dataset_name,
                 modality_configs=modality_cfg,
                 embodiment_tag=embodiment_tag,
+                mode=self.mode,
+                _val_tail_ratio=self.val_tail_ratio,
                 video_backend=self.video_backend,
                 transforms=lam_transform,
                 data_cfg=data_cfg,
@@ -176,7 +200,7 @@ class LeRobotLAMDataset(Dataset):
 
         self.mixture = LeRobotMixtureDataset(
             dataset_mixture,
-            mode="train",
+            mode=self.mode,
             balance_dataset_weights=True,
             seed=42,
             data_cfg=data_cfg,
@@ -195,10 +219,21 @@ class LeRobotLAMDataset(Dataset):
         )
         video_subkey = video_key_full.replace("video.", "")
         fps = float(dataset.metadata.modalities.video[video_subkey].fps)
+        is_human = dataset.tag == EmbodimentTag.HUMAN.value
+        effective_dt_sec = (
+            self.human_frame_dt_sec
+            if is_human and self.human_frame_dt_sec is not None
+            else self.frame_dt_sec
+        )
         delta_arr = _build_temporal_delta_indices(
             num_frames=self.num_frames,
-            frame_dt_sec=self.frame_dt_sec,
+            frame_dt_sec=effective_dt_sec,
             fps=fps,
+        )
+        stride = int(delta_arr[1] - delta_arr[0]) if len(delta_arr) > 1 else 1
+        print(
+            f"[LeRobotLAMDataset][temporal] dataset={dataset.dataset_name} "
+            f"tag={dataset.tag} fps={fps:.3f} dt_sec={effective_dt_sec:.6f} stride={stride}"
         )
 
         for k in video_keys:
@@ -213,12 +248,24 @@ class LeRobotLAMDataset(Dataset):
         return len(self.mixture)
 
     def _try_get_sample(self, index: int) -> Dict:
-        dataset, traj_id, base_index = self.mixture.sample_step(index)
-        raw_data = dataset.get_step_data(traj_id, base_index)
+        dataset, traj_id, base_index, selected_video_keys = self.mixture._sample_candidate(
+            index,
+            max_video_retries=self.max_retries,
+        )
+        raw_data = dataset.get_step_data(
+            traj_id,
+            base_index,
+            modality_keys_override={"video": selected_video_keys},
+        )
         data = dataset.transforms(raw_data)
 
-        # video
-        available_video_keys = dataset.modality_keys["video"]
+        # video: only use non-wrist keys selected by mixture sampling.
+        available_video_keys = [k for k in selected_video_keys if "wrist" not in k.lower()]
+        if not available_video_keys:
+            raise RuntimeError(
+                f"No non-wrist video key selected for dataset {dataset.dataset_name}. "
+                f"selected_video_keys={selected_video_keys}"
+            )
         if self.preferred_video_key and self.preferred_video_key in available_video_keys:
             video_key = self.preferred_video_key
         else:

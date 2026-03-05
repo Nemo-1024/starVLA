@@ -31,8 +31,8 @@ MIXES=(
   "lam_single_fractal_lerobot"
   "lam_single_droid_1_0_1"
   "lam_single_agibot_merge"
-  "lam_single_robomind_agilex_3rgb_delta_action"
-  "lam_single_robomind_franka_1rgb_delta_action"
+  "lam_single_robomind_agilex_3rgb"
+  "lam_single_robomind_franka_1rgb"
   "lam_single_epic_kitchens_100_lerobot"
 )
 

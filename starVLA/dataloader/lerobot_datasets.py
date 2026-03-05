@@ -5,6 +5,7 @@
 # Modification: [suport topdowm processing, suport param from config].
 
 import copy
+import json
 from pathlib import Path
 from typing import Sequence
 
@@ -28,12 +29,62 @@ def _sample_video_delta_indices(action_delta_indices: Sequence[int], num_frames:
         raise ValueError("`action_delta_indices` cannot be empty when building video sampling indices.")
     if num_frames == 1:
         return [int(action_arr[0])]
+    if num_frames == 2:
+        return [int(action_arr[0]), int(action_arr[-1])]
 
     sampled_pos = np.rint(np.linspace(0, action_arr.size - 1, num=num_frames)).astype(np.int64)
     sampled_pos = np.clip(sampled_pos, 0, action_arr.size - 1)
     sampled_pos[0] = 0
     sampled_pos[-1] = action_arr.size - 1
     return action_arr[sampled_pos].astype(np.int64).tolist()
+
+
+def _resolve_video_fps(
+    dataset_path: Path,
+    preferred_video_keys: Sequence[str] | None = None,
+    default_fps: float = 10.0,
+) -> float:
+    info_path = dataset_path / "meta" / "info.json"
+    if not info_path.exists():
+        return float(default_fps)
+
+    with open(info_path, "r") as f:
+        info = json.load(f)
+
+    features = info.get("features", {})
+    video_features = {
+        key: value for key, value in features.items() if isinstance(value, dict) and value.get("dtype") == "video"
+    }
+    if not video_features:
+        print(f"[LeRobotDataset] cannot find video fps information in {dataset_path}/meta/info.json.")
+        print(f"[LeRobotDataset] using default fps: {default_fps}")
+        return float(default_fps)
+
+    candidate_feature = None
+    if preferred_video_keys:
+        for preferred in preferred_video_keys:
+            key_candidates = [preferred]
+            if preferred.startswith("video."):
+                key_candidates.append(preferred.replace("video.", "", 1))
+            for key in key_candidates:
+                if key in video_features:
+                    candidate_feature = video_features[key]
+                    break
+            if candidate_feature is not None:
+                break
+
+    if candidate_feature is None:
+        candidate_feature = next(iter(video_features.values()))
+
+    try:
+        return float(candidate_feature["video_info"]["video.fps"])
+    except (KeyError, TypeError, ValueError):
+        pass
+
+    try:
+        return float(candidate_feature.get("info", {}).get("video.fps", default_fps))
+    except (TypeError, ValueError):
+        return float(default_fps)
 
 
 def make_LeRobotSingleDataset(
@@ -73,6 +124,31 @@ def make_LeRobotSingleDataset(
     
     raw_num_frames = data_cfg.get("num_frames", 1) if data_cfg else 1
     num_frames = int(raw_num_frames) if raw_num_frames is not None else 1
+    sec_chunk = data_cfg.get("sec_chunk", None) if data_cfg else None
+    preferred_video_keys = modality_config.get("video").modality_keys if "video" in modality_config else None
+    resolved_action_hz = _resolve_video_fps(
+        dataset_path=dataset_path,
+        preferred_video_keys=preferred_video_keys,
+    )
+    if sec_chunk is not None and "action" in modality_config:
+        sec_chunk_f = float(sec_chunk)
+        if sec_chunk_f <= 0:
+            raise ValueError(f"`sec_chunk` must be > 0, got {sec_chunk}.")
+
+        fps = float(resolved_action_hz)
+        chunk_len = int(sec_chunk_f * fps)
+        if chunk_len < 1:
+            raise ValueError(
+                f"`sec_chunk` is too small for this dataset fps: sec_chunk={sec_chunk_f}, fps={fps}, "
+                f"int(sec_chunk * fps)={chunk_len}. Please increase `sec_chunk`."
+            )
+
+        modality_config["action"].delta_indices = list(range(chunk_len))
+        print(
+            f"[LeRobotDataset] dataset={data_name} robot={robot_type} sec_chunk={sec_chunk_f} "
+            f"fps={fps} action_horizon={chunk_len}"
+        )
+
     if "action" in modality_config and "video" in modality_config:
         action_delta_indices = modality_config["action"].delta_indices
         sampled_video_delta = _sample_video_delta_indices(
@@ -92,6 +168,7 @@ def make_LeRobotSingleDataset(
         modality_configs=modality_config,
         transforms=transforms,
         embodiment_tag=embodiment_tag,
+        action_hz=resolved_action_hz,
         mode=mode,
         video_backend=video_backend,
         data_cfg=data_cfg,

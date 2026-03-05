@@ -1,126 +1,153 @@
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 from typing import Optional, Tuple
 from .modules import CategorySpecificMLP
 from .pos_embs import Fixed2DPositionalEncoding
 
 
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """AdaLN modulation: x * (1 + scale) + shift"""
+    return x * (1 + scale) + shift
+
+
+class AdaLNBlock(nn.Module):
+    """
+    Pre-norm Transformer block with Adaptive Layer Normalization (AdaLN) conditioning.
+
+    Each block receives a conditioning vector c ~ [B, D] (action embedding) and
+    uses a per-block linear to produce (shift_msa, scale_msa, gate_msa,
+    shift_mlp, scale_mlp, gate_mlp), following the DiT design.
+
+    The gate weights are zero-initialized so the block starts as an identity,
+    giving stable training from scratch.
+    """
+
+    def __init__(self, dim: int, num_heads: int, ffn_expansion_factor: float = 2.0, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        ffn_dim = int(dim * ffn_expansion_factor)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, dim),
+            nn.Dropout(dropout),
+        )
+        # SiLU → Linear produces 6 modulation params: (shift/scale/gate) × (attn, ffn)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True),
+        )
+        # Zero-init: gates start at 0 → blocks are identity at init
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, K, D] visual tokens
+            c: [B, D]    action conditioning vector
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        # unsqueeze token dim for broadcasting: [B, D] → [B, 1, D]
+        shift_msa = shift_msa.unsqueeze(1)
+        scale_msa = scale_msa.unsqueeze(1)
+        gate_msa  = gate_msa.unsqueeze(1)
+        shift_mlp = shift_mlp.unsqueeze(1)
+        scale_mlp = scale_mlp.unsqueeze(1)
+        gate_mlp  = gate_mlp.unsqueeze(1)
+
+        normed = modulate(self.norm1(x), shift_msa, scale_msa)
+        attn_out, _ = self.attn(normed, normed, normed)
+        x = x + gate_msa * attn_out
+
+        normed = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp * self.ffn(normed)
+        return x
+
+
 class LAMDecoder_v2(nn.Module):
     """
-    通过堆叠多个 DecoderBlock，将动作应用到状态上，以重建下一帧的特征。
+    通过堆叠多个 AdaLN Transformer block，将动作条件注入到视觉特征中，
+    以重建下一帧的特征。动作通过 Adaptive LayerNorm 调制每层的 scale/shift，
+    与 DiT 架构一致，不依赖特征幅度，梯度路径稳健。
     """
-    def __init__(self, context_dim, input_dim: int=1024, num_queries: int=1, num_layers=6, num_heads=16, dropout=0.1, grid_hw: Tuple[int, int] = (16, 20), train_in_latent: bool = True, ffn_expansion_factor=2, num_embodiments: int = 32, code_dim: Optional[int] = None):
-        """
-        初始化 LAMDecoder_v2。
-        
-        参数:
-            context_dim (int): 状态/动作特征维度 (D_feat)。
-            input_dim (int): 输入特征的维度 (D_feat)。
-            num_layers (int): DecoderBlock 的堆叠层数。
-            num_heads (int): 每个注意力模块的头数。
-        """
+    def __init__(self, context_dim, input_dim: int=1024, num_queries: int=1, num_layers=6, num_heads=16, dropout=0.1, grid_hw: Tuple[int, int] = (16, 16), train_in_latent: bool = True, ffn_expansion_factor=2, num_embodiments: int = 32, code_dim: Optional[int] = None):
         super().__init__()
         self.feature_dim = context_dim
         self.input_dim = input_dim
         self.train_in_latent = train_in_latent
         self.grid_height = int(grid_hw[0])
         self.grid_width = int(grid_hw[1])
-            
-        # 解码层
-        # self.dec_layers = nn.ModuleList([
-        #     CrossAttentionBlock(feature_dim, num_heads=num_heads, ffn_ratio=4, dropout=dropout) 
-        #     for _ in range(num_layers)
-        # ])
         self.num_queries = num_queries
-        # if self.num_queries == 1:
-        self.dec_layers = nn.ModuleList([nn.TransformerEncoderLayer(context_dim, num_heads, dim_feedforward=int(context_dim*ffn_expansion_factor), dropout=dropout, batch_first=True, norm_first=True) for _ in range(num_layers)])
-        # else:
-            # self.dec_layers = nn.ModuleList([Attn_Crossn_Block(feature_dim, num_heads=num_heads, ffn_expansion_factor=ffn_expansion_factor, dropout=dropout) for _ in range(num_layers)])
+
+        self.dec_layers = nn.ModuleList([
+            AdaLNBlock(context_dim, num_heads, ffn_expansion_factor=ffn_expansion_factor, dropout=dropout)
+            for _ in range(num_layers)
+        ])
         self.pos_embed = Fixed2DPositionalEncoding(context_dim, self.grid_height, self.grid_width)
-        # # Query self-attention增强
-        # self.query_attn = nn.MultiheadAttention(
-        #     embed_dim=feature_dim,
-        #     num_heads=num_heads,
-        #     dropout=dropout,
-        #     batch_first=True,
-        # )
-        # self.last_ln = nn.LayerNorm(input_dim)
-        # 简化输入输出投影，避免冗余
+        self.last_ln = nn.LayerNorm(input_dim)
+
         if input_dim == context_dim:
             self.project_input = nn.Identity()
             self.project_output = nn.Identity()
         else:
             self.project_input = nn.Linear(input_dim, context_dim)
             self.project_output = nn.Linear(context_dim, input_dim)
+
+        # 动作投影：将 code_dim → context_dim，作为 AdaLN 的 conditioning vector
         if code_dim is not None and code_dim != context_dim:
-            self.action_in_proj = nn.Sequential(
-                nn.Linear(code_dim, context_dim),
-                nn.LayerNorm(context_dim),
-            )
+            self.action_in_proj = nn.Linear(code_dim, context_dim)
         else:
-            # code_dim == context_dim 时也进行归一化，降低异常 latent 的注入冲击。
-            self.action_in_proj = nn.LayerNorm(context_dim)
+            self.action_in_proj = nn.Identity()
+
         if not train_in_latent:
             self.to_pixel = nn.ConvTranspose2d(input_dim, 3, kernel_size=16, stride=16)
-        
+
     def forward(self, features, actions):
         """
-        前向传播。
-        
-        参数:
-            features (torch.Tensor): 初始帧的特征，形状 [B, 1, K, input_dim]。
-            actions (torch.Tensor): VQ量化后的动作code，形状 [B, 1, node_dim]。
-            states (torch.Tensor): 初始状态，形状 [B, 1, 8]。
-            embodiment_id (torch.Tensor): [B] 或 [B,1]，选择 embodiment 特定参数（本模块未使用）。
-            
-        返回:
-            torch.Tensor: 重建的最后一帧特征 f_hat_T，形状 [B, 1, K, input_dim]。
+        Args:
+            features: [B, 1, K, input_dim]  初始帧的视觉特征
+            actions:  [B, 1, code_dim]       VQ量化后的动作 latent
+        Returns:
+            [B, 1, K, input_dim]  重建的下一帧特征
         """
-        # 投影query并使用self-attention增强
-        actions_tokens = self.action_in_proj(actions)  # [B, 1, feature_dim]
-        
-        # 投影输入特征（只调用一次，避免冗余）
-        features_tokens = self.project_input(features)  # [B, 1, K, feature_dim] 或 [B, K, feature_dim]
+        # 动作 → conditioning vector [B, D]（squeeze 时间维，每帧一个条件向量）
+        c = self.action_in_proj(actions)           # [B, 1, context_dim]
+        if c.dim() == 3:
+            c = c.squeeze(1)                       # [B, context_dim]
 
+        features_tokens = self.project_input(features)
         if features_tokens.dim() == 4:
-            # 将单帧时间维压缩，Transformer 期望 3D: [B, S, E]
-            features_tokens = features_tokens.squeeze(1)  # [B, K, feature_dim]
+            features_tokens = features_tokens.squeeze(1)   # [B, K, context_dim]
+
         expected_tokens = int(self.grid_height * self.grid_width)
         if features_tokens.shape[1] != expected_tokens:
             raise ValueError(
                 f"Decoder token mismatch: got K={features_tokens.shape[1]}, expected K={expected_tokens} "
                 f"for grid_hw=({self.grid_height},{self.grid_width})."
             )
-        features_tokens = self.pos_embed(features_tokens)
-        if actions_tokens.shape[1] == 1:
-            # 将动作条件加到每个空间token上，自动在K维广播
-            x = features_tokens + actions_tokens  # [B, K, feature_dim]
-            # x = torch.cat([features_tokens, actions_tokens], dim=1)
-            # 通过解码层堆叠
-            for layer in self.dec_layers:
-                x = layer(x)
-        else:
-            x = torch.cat([features_tokens, actions_tokens], dim=1)
-            # x = features_tokens
-            for layer in self.dec_layers:
-                x = layer(x)
-        # 输出投影
-        reconstructed_features = self.project_output(x[:, :features_tokens.shape[1]])  # [B, K, input_dim]
-        # reconstructed_features = self.last_ln(reconstructed_features)
-        # 统一返回形状为 [B, 1, K, *]
+
+        x = self.pos_embed(features_tokens)        # [B, K, context_dim]
+
+        for layer in self.dec_layers:
+            x = layer(x, c)                        # c 通过 AdaLN 调制每层
+
+        reconstructed_features = self.project_output(x)   # [B, K, input_dim]
+        reconstructed_features = self.last_ln(reconstructed_features)
+
         if not self.train_in_latent:
             B, K, D = reconstructed_features.shape
-            if K != expected_tokens:
-                raise ValueError(
-                    f"Decoder output token mismatch: got K={K}, expected K={expected_tokens} "
-                    f"for grid_hw=({self.grid_height},{self.grid_width})."
-                )
             rec_img = self.to_pixel(
                 reconstructed_features.transpose(1, 2).reshape(B, D, self.grid_height, self.grid_width)
-            )  # [B, 3, H, W]
-            return rec_img.unsqueeze(1)  # [B, 1, 3, H, W]
+            )
+            return rec_img.unsqueeze(1)            # [B, 1, 3, H, W]
         else:
-            return reconstructed_features.unsqueeze(1)  # [B, 1, K, input_dim]
+            return reconstructed_features.unsqueeze(1)     # [B, 1, K, input_dim]
 
 
 class StatePredictor(nn.Module):

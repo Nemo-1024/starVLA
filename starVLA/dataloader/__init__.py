@@ -35,7 +35,8 @@ def build_dataloaders(cfg) -> tuple[DataLoader, Optional[DataLoader]]:
 
     vla_dataset_cfg = cfg.datasets.vla_data
     batch_size = cfg.datasets.vla_data.per_device_batch_size
-    num_workers = 4
+    num_workers = 6
+    prefetch_factor=4
 
     vla_train_dataset = get_vla_dataset(data_cfg=vla_dataset_cfg, mode="train")
 
@@ -44,6 +45,7 @@ def build_dataloaders(cfg) -> tuple[DataLoader, Optional[DataLoader]]:
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
         # shuffle=True
     )
 
@@ -55,6 +57,7 @@ def build_dataloaders(cfg) -> tuple[DataLoader, Optional[DataLoader]]:
             batch_size=batch_size,
             collate_fn=collate_fn,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
             # shuffle=False
         )
     except ValueError as exc:

@@ -19,9 +19,9 @@
 | `fractal_lerobot` | `observation.state` | Quaternion | 轴名含 `rx,ry,rz,rw` |
 | `droid_1.0.1` | `observation.state.cartesian_position` | Euler RPY | 轴名含 `roll,pitch,yaw` |
 | `AgiBot_merge_delta_action` | `observation.states.end.orientation` | Quaternion | 8维，左右各 `x,y,z,w` |
-| `robomind_agilex_3rgb_delta_action` | `observation.states.end_effector_left/right` | Quaternion | 7维中姿态为 `rx,ry,rz,rw` |
-| `robomind_franka_1rgb_delta_action` | `observation.states.end_effector` | Euler RPY | 轴名 `x,y,z,r,p,y`（rpy） |
-| `robomind_franka_3rgb_delta_action` | `observation.states.end_effector` | Euler RPY | 轴名 `x,y,z,r,p,y`（rpy） |
+| `robomind_agilex_3rgb` | `observation.states.end_effector_left/right` | Quaternion | 7维中姿态为 `rx,ry,rz,rw` |
+| `robomind_franka_1rgb` | `observation.states.end_effector` | Euler RPY | 轴名 `x,y,z,r,p,y`（rpy） |
+| `robomind_franka_3rgb` | `observation.states.end_effector` | Euler RPY | 轴名 `x,y,z,r,p,y`（rpy） |
 | `robomind_ur_1rgb` | `observation.states.end_effector` | Euler RPY | 轴名 `x,y,z,r,p,y`（rpy） |
 | `robomind_franka_fr3_dual` | `observation.states.end_effector` | Euler RPY | names 为 `left_xyzrpy/right_xyzrpy` |
 | `epic_kitchens_100_lerobot` | `state.xyz_rotation_6d_gripper` | rotation_6d（打包） | 字段名直接包含 `rotation_6d` |
@@ -35,9 +35,9 @@
 | `fractal_lerobot` | `action` | Euler RPY | 轴名含 `roll,pitch,yaw` |
 | `droid_1.0.1` | `action.cartesian_velocity` | Euler RPY | 轴名含 `roll,pitch,yaw` |
 | `AgiBot_merge_delta_action` | `actions.delta` | axis-angle(rotvec)（高置信） | 轴名为 `delta_end_ori_*_rx/ry/rz` |
-| `robomind_agilex_3rgb_delta_action` | `actions.delta_eef_left/right` | axis-angle(rotvec)（高置信） | 轴名为 `dx,dy,dz,rx,ry,rz,dg` |
-| `robomind_franka_1rgb_delta_action` | `actions.eef_rot` | Euler delta（RPY） | 轴名为 `droll,dpitch,dyaw` |
-| `robomind_franka_3rgb_delta_action` | `actions.eef_rot` | Euler delta（RPY） | 轴名为 `droll,dpitch,dyaw` |
+| `robomind_agilex_3rgb` | `actions.delta_eef_left/right` | axis-angle(rotvec)（高置信） | 轴名为 `dx,dy,dz,rx,ry,rz,dg` |
+| `robomind_franka_1rgb` | `actions.eef_rot` | Euler delta（RPY） | 轴名为 `droll,dpitch,dyaw` |
+| `robomind_franka_3rgb` | `actions.eef_rot` | Euler delta（RPY） | 轴名为 `droll,dpitch,dyaw` |
 | `robomind_ur_1rgb` | `actions.joint_position` | 无明确姿态 action 字段 | action 只有关节+夹爪轴名 |
 | `robomind_franka_fr3_dual` | `actions.joint_position` | 无明确姿态 action 字段 | action 只有双臂关节+夹爪轴名 |
 | `epic_kitchens_100_lerobot` | `action.xyz_rotation_6d_gripper` | rotation_6d（打包） | 字段名直接包含 `rotation_6d` |

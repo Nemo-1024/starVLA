@@ -12,15 +12,15 @@ seed_everything: 42
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
-  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
-  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
+  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
-  dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
-  enc_layers: 24               # LAM 编码器层数 16head
-  ffn_expansion_factor: 4
-  num_heads: 16
-  max_state_dim: 32            # 与 data.max_state_dim 对齐（多数据集 state padding）
+  dim: 768                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
+  enc_layers: 12               # LAM 编码器层数 16head
+  ffn_expansion_factor: 3
+  num_heads: 12
+  max_state_dim: 14            # 与 data.max_state_dim 对齐（多数据集 state padding）
   num_embodiments: 32
   codebook_size: 32        # 码本大小
   code_dim: 32                # 码本维度
@@ -30,13 +30,13 @@ model:
   patch_size: 16
   image_aug: true
   dual_view_aug: true
-  dec_layers: 24                # 解码器层数
+  dec_layers: 6                # 解码器层数 改用DiT，要除以2
   dropout: 0.0                 # Dropout 率              
-  warmup_steps: 10000           # 预热步数；0 表示关闭预热
+  warmup_steps: 2000           # 预热步数；0 表示关闭预热
   enc_add_state: false
   enc_modal_mask: true
   lambda_aux: 1.0                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
-  loss_type: "smooth_l1"
+  loss_type: "l2"
   state_loss_type: "l2"
 
   latent_layer_to_use: -2
@@ -49,7 +49,7 @@ model:
     layer_norm: true
 
   project: lam
-  task_name: dino_large_vae
+  task_name: dino_base_vae_l2_batch64
 
 
   wandb_offline: true
@@ -59,7 +59,7 @@ model:
     class_path: torch.optim.AdamW
     init_args:
       lr: 1e-4
-      weight_decay: 0.04
+      weight_decay: 1e-2
   exclude_bias_norm_from_wd: true
   
   # 索引保存参数
@@ -74,6 +74,7 @@ data:
   video_backend: "pyav"  # torchcodec is very slow on AgiBot AV1 random-access training
   num_frames: 2
   frame_dt_sec: 1.6
+  human_frame_dt_sec: 0.4
   batch_size: 64
   # 多卡默认使用更保守的数据加载并发，避免视频解码触发主机内存峰值
   num_workers: 6
@@ -82,7 +83,7 @@ data:
   persistent_workers: false
   in_order: false  # 快 worker 先出队，减少周期性卡顿
   debug_repeat_batch: false
-  max_state_dim: 32
+  max_state_dim: 14
 
 # 训练器参数
 trainer:
@@ -96,10 +97,10 @@ trainer:
   log_every_n_steps: 1000
   gradient_clip_val: 1.0
   # enable_progress_bar: false  # 禁用重复的进度条
-  # 关闭训练期间验证
-  val_check_interval: null
+  # 启用每个 epoch 的验证
+  val_check_interval: 1.0
   num_sanity_val_steps: 0
-  limit_val_batches: 0
+  limit_val_batches: 1.0
 
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
@@ -120,7 +121,7 @@ trainer:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
         save_dir: latent_action_model/logs
-        name:  dino_large_vae
+        name:  dino_base_vae_l2_batch64
 
 
 

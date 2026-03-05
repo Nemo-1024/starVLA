@@ -48,6 +48,9 @@ datasets:
   vla_data:
     data_root_dir: playground/Datasets/OXE_LEROBOT_DATASET
     data_mix: bridge_rt_1 # bridge_rt_1
+    # Optional: override action horizon by seconds per chunk.
+    # Example: sec_chunk: 1.6  -> action_indices = range(int(1.6 * fps))
+    # sec_chunk: null
     action_type: delta_ee
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     CoT_answer: bbox

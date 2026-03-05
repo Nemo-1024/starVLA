@@ -6,7 +6,11 @@ import numpy as np
 import torch
 
 from starVLA.model.framework.base_framework import baseframework
-from starVLA.model.framework.latent_world import LiberoExample, build_policy_components
+from starVLA.model.framework.latent_world import (
+    LatentWorldPolicyInferExample,
+    LatentWorldPolicyTrainExample,
+    build_policy_components,
+)
 from starVLA.model.framework.latent_world.runtime.freeze_policy import (
     apply_policy_freeze,
     parse_policy_freeze_config,
@@ -27,7 +31,8 @@ class LatentWorldVLAIndependentFramework(baseframework):
         self.policy_cfg = components.policy_cfg
         self.policy_backend = components.policy_backend
         self.policy_vlm_adapter = components.policy_vlm_adapter
-        self.policy_batch_builder = components.policy_batch_builder
+        self.policy_train_batch_builder = components.train_batch_builder
+        self.policy_infer_batch_builder = components.infer_batch_builder
         self.policy_runner = components.runner
         self.policy_action_head = self.policy_backend.flow
 
@@ -37,12 +42,12 @@ class LatentWorldVLAIndependentFramework(baseframework):
         freeze_policy = parse_policy_freeze_config(freeze_cfg)
         apply_policy_freeze(self.policy_backend, freeze_policy)
 
-    def forward(self, examples: Sequence[LiberoExample], **kwargs) -> Dict[str, torch.Tensor]:
+    def forward(self, examples: Sequence[LatentWorldPolicyTrainExample], **kwargs) -> Dict[str, torch.Tensor]:
         del kwargs
         return self.policy_runner.train_step(examples)
 
     @torch.inference_mode()
-    def predict_action(self, examples: Sequence[LiberoExample], **kwargs) -> Dict[str, np.ndarray]:
+    def predict_action(self, examples: Sequence[LatentWorldPolicyInferExample], **kwargs) -> Dict[str, np.ndarray]:
         del kwargs
         return self.policy_runner.infer_step(examples)
 

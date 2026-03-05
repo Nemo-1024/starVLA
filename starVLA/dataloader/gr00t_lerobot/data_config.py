@@ -68,12 +68,12 @@ def _build_composed_transform(
 class DroidDataConfig:
     video_keys = [
         "video.primary_view",
-        # "video.secondary_view",
+        "video.secondary_view",
         "video.wrist_view",
     ]
     state_keys = [
         "state.eef_position",
-        "state.eef_orientation_rotvec",
+        "state.eef_orientation",
         "state.gripper",
     ]
     action_keys = [
@@ -129,8 +129,8 @@ class DroidDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.eef_position": "q99",
-                    "state.eef_orientation_rotvec": "q99",
+                    "state.eef_position": "min_max",
+                    "state.eef_orientation": "min_max",
                     "state.gripper": "binary",
                 },
                 # target_rotations={
@@ -142,18 +142,18 @@ class DroidDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.eef_position": "q99",
-                    "action.eef_orientation": "q99",
+                    "action.eef_position": "min_max",
+                    "action.eef_orientation": "min_max",
                     "action.gripper": "binary",
                 },
                 # target_rotations={"action.eef_rotation_delta": "axis_angle"},
             ),
             # concat transforms
-            ConcatTransform(
-                video_concat_order=self.video_keys,
-                state_concat_order=self.state_keys,
-                action_concat_order=self.action_keys,
-            ),
+            # ConcatTransform(
+            #     video_concat_order=self.video_keys,
+            #     state_concat_order=self.state_keys,
+            #     action_concat_order=self.action_keys,
+            # ),
             # GR00TTransform(
             #     state_horizon=len(self.observation_indices),
             #     action_horizon=len(self.action_indices),
@@ -172,6 +172,8 @@ class BridgeDataConfig:
     video_keys = [
         "video.primary_view",
         "video.wrist_view",
+        # "video.side1",
+        # "video.side2",
     ]
     state_keys = [
         "state.x",
@@ -235,10 +237,10 @@ class BridgeDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.x": "q99",
-                    "state.y": "q99",
-                    "state.z": "q99",
-                    "state.eef_orientation_rotvec": "q99",
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.eef_orientation_rotvec": "min_max",
                     "state.gripper": "binary",
                 },
             ),
@@ -247,10 +249,10 @@ class BridgeDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.x": "q99",
-                    "action.y": "q99",
-                    "action.z": "q99",
-                    "action.eef_orientation_rotvec": "q99",
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.eef_orientation_rotvec": "min_max",
                     "action.gripper": "binary",
                 },
             ),
@@ -344,13 +346,13 @@ class OxeRT1DataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.x": "q99",
-                    "state.y": "q99",
-                    "state.z": "q99",
-                    "state.rx": "q99",
-                    "state.ry": "q99",
-                    "state.rz": "q99",
-                    "state.rw": "q99",
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.rx": "min_max",
+                    "state.ry": "min_max",
+                    "state.rz": "min_max",
+                    "state.rw": "min_max",
                     "state.gripper": "binary",
                 },
             ),
@@ -403,7 +405,7 @@ class FractalDataConfig:
         "action.x",
         "action.y",
         "action.z",
-        "eef_orientation_rotvec",
+        "action.eef_orientation_rotvec",
         "action.gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
@@ -442,10 +444,10 @@ class FractalDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.x": "q99",
-                    "state.y": "q99",
-                    "state.z": "q99",
-                    "state.eef_orientation_rotvec": "q99",
+                    "state.x": "min_max",
+                    "state.y": "min_max",
+                    "state.z": "min_max",
+                    "state.eef_orientation_rotvec": "min_max",
                     "state.gripper": "binary",
                 },
             ),
@@ -454,10 +456,10 @@ class FractalDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.x": "q99",
-                    "action.y": "q99",
-                    "action.z": "q99",
-                    "eef_orientation_rotvec": "q99",
+                    "action.x": "min_max",
+                    "action.y": "min_max",
+                    "action.z": "min_max",
+                    "action.eef_orientation_rotvec": "min_max",
                     "action.gripper": "binary",
                 },
             ),
@@ -863,8 +865,8 @@ class AgilexDataConfig:
     """Configuration for RoboMIND Agilex dual-arm robot with rich state/action information"""
     video_keys = [
         "video.cam_high",                # front/high camera
-        # "video.cam_left_wrist",          # left wrist camera
-        # "video.cam_right_wrist",         # right wrist camera
+        "video.cam_left_wrist",          # left wrist camera
+        "video.cam_right_wrist",         # right wrist camera
     ]
     state_keys = [
 
@@ -936,11 +938,11 @@ class AgilexDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.left_eef_position": "q99",
-                    "state.left_eef_orientation_rotvec": "q99",
+                    "state.left_eef_position": "min_max",
+                    "state.left_eef_orientation_rotvec": "min_max",
                     "state.left_gripper": "binary",
-                    "state.right_eef_position": "q99",
-                    "state.right_eef_orientation_rotvec": "q99",
+                    "state.right_eef_position": "min_max",
+                    "state.right_eef_orientation_rotvec": "min_max",
                     "state.right_gripper": "binary",
                 },
             ),
@@ -949,11 +951,11 @@ class AgilexDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.delta_left_eef_position": "q99",
-                    "action.delta_left_eef_orientation": "q99",
+                    "action.delta_left_eef_position": "min_max",
+                    "action.delta_left_eef_orientation": "min_max",
                     "action.delta_left_gripper": "binary",
-                    "action.delta_right_eef_position": "q99",
-                    "action.delta_right_eef_orientation": "q99",
+                    "action.delta_right_eef_position": "min_max",
+                    "action.delta_right_eef_orientation": "min_max",
                     "action.delta_right_gripper": "binary",
                 },
             ),
@@ -968,8 +970,8 @@ class AgibotGenieDataConfig:
     """Configuration for AgiBOT humanoid robot with dual arms"""
     video_keys = [
         "video.head",
-        # "video.hand_left",
-        # "video.hand_right",
+        "video.wrist_left",
+        "video.wrist_right",
     ]
     state_keys = [
         # "state.joint_left",              # 7-dim: left arm joints
@@ -986,12 +988,12 @@ class AgibotGenieDataConfig:
     action_keys = [
         # "action.joint_left",             # 7-dim: left arm joints
         # "action.joint_right",            # 7-dim: right arm joints
-        "action.delta_end_position_left",      # 3-dim: left end effector position (x, y, z)
-        "action.delta_end_orientation_left",   # 4-dim: left end effector orientation (quaternion)
-        "action.delta_gripper_left",           # 1-dim: left gripper
-        "action.delta_end_position_right",     # 3-dim: right end effector position (x, y, z)
-        "action.delta_end_orientation_right",  # 3-dim: right end effector orientation (quaternion)
-        "action.delta_gripper_right",          # 1-dim: right gripper
+        "action.end_position_left",      # 3-dim: left end effector position (x, y, z)
+        "action.end_orientation_left",   # 4-dim: left end effector orientation (quaternion)
+        "action.gripper_left",           # 1-dim: left gripper
+        "action.end_position_right",     # 3-dim: right end effector position (x, y, z)
+        "action.end_orientation_right",  # 3-dim: right end effector orientation (quaternion)
+        "action.gripper_right",          # 1-dim: right gripper
         # "action.waist",                  # 2-dim: waist position (pitch, lift)
         # "action.head",                   # 2-dim: head position (yaw, patch)
         # "action.robot_velocity",         # 2-dim: robot base velocity (x_vel, yaw_vel)
@@ -1034,11 +1036,11 @@ class AgibotGenieDataConfig:
                 normalization_modes={
                     # "state.joint_left": "min_max",
                     # "state.joint_right": "min_max",
-                    "state.end_position_left": "q99",
-                    "state.end_orientation_left_rotvec": "q99",
+                    "state.end_position_left": "min_max",
+                    "state.end_orientation_left_rotvec": "min_max",
                     "state.gripper_left": "binary",
-                    "state.end_position_right": "q99",
-                    "state.end_orientation_right_rotvec": "q99",
+                    "state.end_position_right": "min_max",
+                    "state.end_orientation_right_rotvec": "min_max",
                     "state.gripper_right": "binary",
                 },
             ),
@@ -1049,22 +1051,22 @@ class AgibotGenieDataConfig:
                 normalization_modes={
                     # "action.joint_left": "min_max",
                     # "action.joint_right": "min_max",
-                    "action.delta_end_position_left": "q99",
-                    "action.delta_end_orientation_left": "q99",
-                    "action.delta_gripper_left": "binary",
-                    "action.delta_end_position_right": "q99",
-                    "action.delta_end_orientation_right": "q99",
-                    "action.delta_gripper_right": "binary",
-                    # "action.waist": "q99",
-                    # "action.head": "q99",
-                    # "action.robot_velocity": "q99",
+                    "action.end_position_left": "min_max",
+                    "action.end_orientation_left": "min_max",
+                    "action.gripper_left": "binary",
+                    "action.end_position_right": "min_max",
+                    "action.end_orientation_right": "min_max",
+                    "action.gripper_right": "binary",
+                    # "action.waist": "min_max",
+                    # "action.head": "min_max",
+                    # "action.robot_velocity": "min_max",
                 },
             ),
-            ConcatTransform(
-                video_concat_order=self.video_keys,
-                state_concat_order=self.state_keys,
-                action_concat_order=self.action_keys,
-            ),
+            # ConcatTransform(
+            #     video_concat_order=self.video_keys,
+            #     state_concat_order=self.state_keys,
+            #     action_concat_order=self.action_keys,
+            # ),
         ]
 
         return _build_composed_transform(transforms, self.state_keys, self.action_keys)
@@ -1124,8 +1126,8 @@ class RoboMINDFranka1RGBDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.eef_position": "q99",            # 原 end_effector_position
-                    "state.eef_orientation": "q99",         # 原 end_effector_orientation
+                    "state.eef_position": "min_max",            # 原 end_effector_position
+                    "state.eef_orientation": "min_max",         # 原 end_effector_orientation
                     "state.gripper": "binary",
                 },
             ),
@@ -1134,8 +1136,8 @@ class RoboMINDFranka1RGBDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.eef_position": "q99",     # 3-dim: end effector position (x, y, z)
-                    "action.eef_orientation": "q99", # 3-dim: end effector orientation (roll, pitch, yaw) - 原 eef_rotation
+                    "action.eef_position": "min_max",     # 3-dim: end effector position (x, y, z)
+                    "action.eef_orientation": "min_max", # 3-dim: end effector orientation (roll, pitch, yaw) - 原 eef_rotation
                     "action.gripper": "binary",
                 },
             ),
@@ -1151,8 +1153,8 @@ class RoboMINDFranka3RGBDataConfig:
     """Configuration for RoboMIND Franka single-arm robot with 3 RGB cameras"""
     video_keys = [
         "video.primary_view",            # top-view camera (1280x720) - 原 camera_top
-        # "video.left_view",               # left-view camera (640x480) - 原 camera_left
-        # "video.right_view",              # right-view camera (640x480) - 原 camera_right
+        "video.left_view",               # left-view camera (640x480) - 原 camera_left
+        "video.right_view",              # right-view camera (640x480) - 原 camera_right
     ]
     state_keys = [
         "state.eef_position",            # 3-dim: end effector position (x, y, z) - 原 end_effector_position
@@ -1200,8 +1202,8 @@ class RoboMINDFranka3RGBDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.eef_position": "q99",            # 原 end_effector_position
-                    "state.eef_orientation": "q99",         # 原 end_effector_orientation
+                    "state.eef_position": "min_max",            # 原 end_effector_position
+                    "state.eef_orientation": "min_max",         # 原 end_effector_orientation
                     "state.gripper": "binary",
                 },
             ),
@@ -1210,8 +1212,8 @@ class RoboMINDFranka3RGBDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.eef_position": "q99",
-                    "action.eef_orientation": "q99",
+                    "action.eef_position": "min_max",
+                    "action.eef_orientation": "min_max",
                     "action.gripper": "binary",
                 },
             ),
@@ -1227,7 +1229,7 @@ class RoboMINDFrankaFR3DualDataConfig:
     """Configuration for RoboMIND dual-arm Franka FR3 robot with 4 RGB cameras"""
     video_keys = [
         "video.camera_front",            # front camera (1280x720)
-        # "video.camera_top",              # top camera (1280x720)
+        "video.camera_top",              # top camera (1280x720)
         # "video.camera_left",             # left-view camera (640x480)
         # "video.camera_right",            # right-view camera (640x480)
     ]
@@ -1245,10 +1247,13 @@ class RoboMINDFrankaFR3DualDataConfig:
     ]
     action_keys = [
         # Joint space
-        "action.left_joints",            # 7-dim: left arm joints
-        "action.left_gripper",           # 1-dim: left gripper
-        "action.right_joints",           # 7-dim: right arm joints
-        "action.right_gripper",          # 1-dim: right gripper
+        "action.left_eef_abs_position", 
+        "action.left_eef_abs_orientation_rotvec",
+        "action.left_eef_abs_gripper",
+        "action.right_eef_abs_position",
+        "action.right_eef_abs_orientation_rotvec",
+        "action.right_eef_abs_gripper",
+
     ]
     language_keys = ["annotation.human.action.task_description"]
     observation_indices = [0]
@@ -1286,10 +1291,10 @@ class RoboMINDFrankaFR3DualDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.left_eef_position": "q99",
-                    "state.left_eef_orientation_rotvec": "q99",
-                    "state.right_eef_position": "q99",
-                    "state.right_eef_orientation_rotvec": "q99",
+                    "state.left_eef_position": "min_max",
+                    "state.left_eef_orientation_rotvec": "min_max",
+                    "state.right_eef_position": "min_max",
+                    "state.right_eef_orientation_rotvec": "min_max",
                     # "state.left_joints": "min_max",
                     "state.left_gripper": "binary",
                     # "state.right_joints": "min_max",
@@ -1301,10 +1306,12 @@ class RoboMINDFrankaFR3DualDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.left_joints": "q99",
-                    "action.left_gripper": "binary",
-                    "action.right_joints": "q99",
-                    "action.right_gripper": "binary",
+                    "action.left_eef_abs_position": "min_max",
+                    "action.left_eef_abs_orientation_rotvec": "min_max",
+                    "action.left_eef_abs_gripper": "binary",
+                    "action.right_eef_abs_position": "min_max",
+                    "action.right_eef_abs_orientation_rotvec": "min_max",
+                    "action.right_eef_abs_gripper": "binary",
                 },
             ),
         ]
@@ -1327,9 +1334,9 @@ class RoboMINDUR1RGBDataConfig:
         "state.gripper",                 # 1-dim: gripper position
     ]
     action_keys = [
-        "action.eef_position",     # 3-dim: end effector position (x, y, z)
-        "action.eef_orientation",  # 3-dim: end effector orientation (roll, pitch, yaw) - 原 eef_rotation
-        "action.gripper",                # 1-dim: gripper position
+        "action.eef_position",   
+        "action.eef_orientation_rotvec",
+        "action.eef_gripper",          # 1-dim: gripper command
     ]
     language_keys = ["annotation.human.action.task_description"]
     observation_indices = [0]
@@ -1367,8 +1374,8 @@ class RoboMINDUR1RGBDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.end_effector_position": "q99",
-                    "state.eef_orientation_rotvec": "q99",
+                    "state.end_effector_position": "min_max",
+                    "state.eef_orientation_rotvec": "min_max",
                     # "state.joint_position": "min_max",
                     "state.gripper": "binary",
                 },
@@ -1378,9 +1385,9 @@ class RoboMINDUR1RGBDataConfig:
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.eef_position": "q99",     # 3-dim: end effector position (x, y, z)
-                    "action.eef_orientation": "q99", # 3-dim: end effector orientation (roll, pitch, yaw) - 原 eef_rotation 
-                    "action.gripper": "binary",
+                    "action.eef_position": "min_max",
+                    "action.eef_orientation_rotvec": "min_max",
+                    "action.eef_gripper": "binary",
                 },
             ),
         ]
@@ -1392,18 +1399,21 @@ class RoboMINDUR1RGBDataConfig:
 
 ###########################################################################################
 
-
 class HumanVideoDataConfig:
-    """Configuration aligned with LeRobot modality keys used by epic_kitchens_100_lerobot."""
-
     video_keys = [
         "video.primary_view",
     ]
     state_keys = [
-        "state.dummy_state",
+        "state.left_joints",
+        "state.left_gripper",
+        "state.right_joints",
+        "state.right_gripper",
     ]
     action_keys = [
-        "action.dummy_action",
+        "action.left_joints",
+        "action.left_gripper",
+        "action.right_joints",
+        "action.right_gripper",
     ]
     language_keys = ["annotation.human.action.task_description"]
     observation_indices = [0]
@@ -1420,7 +1430,7 @@ class HumanVideoDataConfig:
         )
         action_modality = ModalityConfig(
             delta_indices=self.action_indices,
-            modality_keys=self.action_keys,
+            modality_keys=self.action_keys, 
         )
         language_modality = ModalityConfig(
             delta_indices=self.observation_indices,
@@ -1440,20 +1450,24 @@ class HumanVideoDataConfig:
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.dummy_state": "min_max",
+                    "state.left_joints": "min_max",
+                    "state.right_joints": "min_max",
+                    "state.left_gripper": "binary",
+                    "state.right_gripper": "binary",
                 },
             ),
             StateActionToTensor(apply_to=self.action_keys),
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.dummy_action": "min_max",
+                    "action.left_joints": "min_max",
+                    "action.right_joints": "min_max",
+                    "action.left_gripper": "binary",
+                    "action.right_gripper": "binary",
                 },
             ),
         ]
         return _build_composed_transform(transforms, self.state_keys, self.action_keys)
-
-
 ###########################################################################################
 
 

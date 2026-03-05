@@ -43,8 +43,6 @@ framework:
       output_dim: 1024
       positional_embeddings: null
 
-
-
 datasets:
   vla_data:
     data_root_dir: playground/Datasets/behavior-1k

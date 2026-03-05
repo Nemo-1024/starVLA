@@ -482,9 +482,18 @@ class StateActionTransform(InvertibleModalityTransform):
                 ), f"Unexpected input dtype: {input_dtype}. Expected type: {torch.dtype}"
                 self._input_dtypes[key] = input_dtype
             else:
-                assert (
-                    data[key].dtype == self._input_dtypes[key]
-                ), f"All states corresponding to the same key must be of the same dtype, input dtype: {data[key].dtype}, expected dtype: {self._input_dtypes[key]}"
+                expected_dtype = self._input_dtypes[key]
+                current_dtype = data[key].dtype
+                if current_dtype != expected_dtype:
+                    # Different datasets/chunks may store the same key with different numeric dtypes
+                    # (e.g. float32 vs float64). Align to the first seen dtype instead of failing.
+                    if torch.can_cast(current_dtype, expected_dtype):
+                        data[key] = data[key].to(expected_dtype)
+                    else:
+                        raise TypeError(
+                            f"All states corresponding to the same key must be of the same dtype, "
+                            f"input dtype: {current_dtype}, expected dtype: {expected_dtype}"
+                        )
             # Rotate the state
             state = data[key]
             if key in self._rotation_transformers:

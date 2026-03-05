@@ -18,7 +18,6 @@ import os
 from pathlib import Path
 from typing import Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
-import numpy as np
 import time
 import re
 
@@ -458,8 +457,16 @@ class VLATrainer(TrainerUtils):
         model_was_training = bool(getattr(eval_model, "training", True))
         eval_model.eval()
 
-        total_mse = 0.0
-        processed_batches = 0
+        framework_name = str(getattr(getattr(self.config, "framework", None), "name", "")).lower()
+        if framework_name not in {"latentworldvlaindependent", "latent_world_vla_independent"}:
+            raise RuntimeError(
+                "eval_action_model currently only supports LatentWorldVLAIndependent framework."
+            )
+        if not hasattr(eval_model, "policy_runner"):
+            raise RuntimeError("LatentWorld eval requires model.policy_runner.")
+
+        metric_numerator = torch.zeros((), dtype=torch.float64, device=self.accelerator.device)
+        metric_denominator = torch.zeros((), dtype=torch.float64, device=self.accelerator.device)
         val_iter = iter(self.vla_val_dataloader)
 
         try:
@@ -470,38 +477,50 @@ class VLATrainer(TrainerUtils):
                     except StopIteration:
                         break
 
-                    actions = [example["action"] for example in examples]
-                    output_dict = eval_model.predict_action(examples=examples)
+                    try:
+                        pred_actions, gt_actions, action_mask = (
+                            eval_model.policy_runner.infer_step_with_aligned_targets(examples)
+                        )
+                    except Exception as exc:
+                        if self.accelerator.is_main_process:
+                            logger.warning(f"LatentWorld eval skip batch due to runtime error: {exc}")
+                        continue
 
-                    if self.accelerator.is_main_process:
-                        normalized_actions = output_dict["normalized_actions"]  # B, T, D
-                        if torch.is_tensor(normalized_actions):
-                            normalized_actions = normalized_actions.detach().cpu().numpy()
-                        else:
-                            normalized_actions = np.asarray(normalized_actions)
+                    if pred_actions.shape != gt_actions.shape or pred_actions.shape != action_mask.shape:
+                        if self.accelerator.is_main_process:
+                            logger.warning(
+                                "LatentWorld eval skip batch due to shape mismatch: "
+                                f"pred={tuple(pred_actions.shape)}, "
+                                f"gt={tuple(gt_actions.shape)}, "
+                                f"mask={tuple(action_mask.shape)}"
+                            )
+                        continue
 
-                        if len(actions) > 0 and torch.is_tensor(actions[0]):
-                            actions = torch.stack([a.detach().cpu() for a in actions], dim=0).numpy()
-                        else:
-                            actions = np.asarray(actions)
+                    valid_count = action_mask.sum()
+                    if int(valid_count.item()) <= 0:
+                        if self.accelerator.is_main_process:
+                            logger.warning("LatentWorld eval skip batch: empty valid action mask.")
+                        continue
 
-                        num_pots = np.prod(actions.shape)
-                        if num_pots > 0:
-                            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-                            total_mse += float(score / num_pots)
-
-                    processed_batches += 1
+                    sq_error_sum = ((pred_actions - gt_actions) ** 2).masked_select(action_mask).sum()
+                    metric_numerator += sq_error_sum.to(dtype=torch.float64)
+                    metric_denominator += valid_count.to(dtype=torch.float64)
         finally:
             if model_was_training:
                 eval_model.train()
 
+        if dist.is_initialized():
+            dist.all_reduce(metric_numerator, op=dist.ReduceOp.SUM)
+            dist.all_reduce(metric_denominator, op=dist.ReduceOp.SUM)
+
         if self.accelerator.is_main_process:
-            if processed_batches > 0:
-                val_mse_score = total_mse / processed_batches
+            if float(metric_denominator.item()) > 0:
+                val_mse_score = float((metric_numerator / metric_denominator).item())
                 step_metrics["val_mse_score"] = val_mse_score
-                # step_metrics["mse_score"] = val_mse_score
             else:
-                logger.warning("Validation dataloader yielded 0 batches, skip metric logging for this eval step.")
+                logger.warning(
+                    "Validation eval produced no valid batches/elements; skip metric logging for this eval step."
+                )
 
         if dist.is_initialized():
             dist.barrier()  # ensure all processes are synchronized
@@ -520,6 +539,10 @@ class VLATrainer(TrainerUtils):
         """execute single training step"""
         # Guard against mode leakage from eval_action_model().
         self.model.train()
+        base_model = self.accelerator.unwrap_model(self.model)
+        policy_backend = getattr(base_model, "policy_backend", None)
+        if policy_backend is not None and hasattr(policy_backend, "set_flow_train_step"):
+            policy_backend.set_flow_train_step(self.completed_steps)
         with self.accelerator.accumulate(self.model):
             self.optimizer.zero_grad()
 

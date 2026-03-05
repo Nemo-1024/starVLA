@@ -275,6 +275,7 @@ class DiT(ModelMixin, ConfigMixin):
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
         encoder_hidden_states: torch.Tensor,  # Shape: (B, S, D)
         timestep: Optional[torch.LongTensor] = None,
+        hidden_attention_mask: Optional[torch.Tensor] = None,  # hidden self-attn mask: [B, T], True=有效
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
     ):
@@ -297,7 +298,7 @@ class DiT(ModelMixin, ConfigMixin):
                 # 注意：即使 cross_attention_dim=None，仍需要显式传入 None 以确保一致性
                 hidden_states = block(
                     hidden_states,
-                    attention_mask=None,
+                    attention_mask=hidden_attention_mask,
                     encoder_hidden_states=None,  # 强制自注意力模式
                     encoder_attention_mask=None,
                     temb=temb,
@@ -410,6 +411,7 @@ class AlternateVLDiT(DiT):
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
         encoder_hidden_states: torch.Tensor,  # Shape: (B, S, D)
         timestep: Optional[torch.LongTensor] = None,
+        hidden_attention_mask: Optional[torch.Tensor] = None,  # hidden self-attn mask: [B, T], True=有效
         encoder_attention_mask: Optional[torch.Tensor] = None,  # padding mask: [B, S], True=有效
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,  # [B, S], True=视觉tokens
@@ -456,7 +458,7 @@ class AlternateVLDiT(DiT):
                 # 自注意力块（因为 interleave_self_attention=True 已断言）
                 hidden_states = block(
                     hidden_states,
-                    attention_mask=None,
+                    attention_mask=hidden_attention_mask,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,

@@ -52,6 +52,13 @@ def validate_policy_contract(config: Any, policy_cfg: Any) -> None:
         )
 
     data_mix = str(config.datasets.vla_data.data_mix)
+    sec_chunk = config.datasets.vla_data.get("sec_chunk", None)
+    # In fixed-physical-time mode (`sec_chunk` enabled), per-dataset action length
+    # is resolved at dataloader runtime from dataset fps and can differ across sources.
+    # Skip static action_indices-based horizon checks here.
+    if sec_chunk is not None:
+        return
+
     expected_data_horizon = _infer_expected_action_horizon_from_data_mix(data_mix)
     if got != expected_data_horizon:
         raise ValueError(

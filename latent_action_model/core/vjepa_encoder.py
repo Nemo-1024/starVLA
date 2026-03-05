@@ -50,7 +50,8 @@ class VJEPAEncoder(nn.Module):
             model_id: V-JEPA2模型ID
         """
         super().__init__()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Keep encoder construction on CPU; Lightning will place modules on per-rank devices.
+        self.device = torch.device("cpu")
         self.model_id = model_id
         
         # 模型组件
@@ -59,8 +60,12 @@ class VJEPAEncoder(nn.Module):
         
 
         # 加载模型
-        self.model = AutoModel.from_pretrained(self.model_id,trust_remote_code=True,device_map=self.device, dtype=torch.bfloat16)    
-        self.model.to(self.device).eval()
+        self.model = AutoModel.from_pretrained(
+            self.model_id,
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+        )
+        self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
     @torch.no_grad()
@@ -117,7 +122,8 @@ class DINOv3Encoder(nn.Module):
         enable_norm: bool = False,
     ):
         super().__init__()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Keep encoder construction on CPU; Lightning will place modules on per-rank devices.
+        self.device = torch.device("cpu")
         self.model_id = model_id
         self.num_latent_layers = max(int(num_latent_layers), 1)
         self.norm_layer_type = norm_layer_type
@@ -125,7 +131,7 @@ class DINOv3Encoder(nn.Module):
         # 加载 DINOv3 模型
         model = AutoModel.from_pretrained(self.model_id, trust_remote_code=True, dtype=torch.float32)
         model.eval()
-        self.model = model.to(self.device)
+        self.model = model
         for param in self.model.parameters():
             param.requires_grad = False
 
@@ -136,9 +142,9 @@ class DINOv3Encoder(nn.Module):
         if self.norm_layer_type in ("bn", "ln"):
             # 关闭 affine，避免产生可训练参数从而触发“未使用参数”告警
             if self.norm_layer_type == "bn":
-                norm_builder = lambda: nn.SyncBatchNorm(self.feature_dim, affine=False).to(self.device)
+                norm_builder = lambda: nn.SyncBatchNorm(self.feature_dim, affine=False)
             else:
-                norm_builder = lambda: nn.LayerNorm(self.feature_dim, elementwise_affine=False).to(self.device)
+                norm_builder = lambda: nn.LayerNorm(self.feature_dim, elementwise_affine=False)
             self.latent_norms = nn.ModuleList([norm_builder() for _ in range(self.num_latent_layers)])
         else:
             self.latent_norms = None

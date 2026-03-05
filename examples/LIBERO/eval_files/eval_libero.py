@@ -170,13 +170,15 @@ def eval_libero(args: Args) -> None:
                     "instruction": [str(task_description)],
                 }
 
-                # align key with model API --> 这里给了两个图像 --> check training
+                # Align key with latent-world inference API.
                 example_dict = {
-                    "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
-                    "wrist_images": [observation["observation.wrist_image"][0]],
+                    "primary_image": [observation["observation.primary"][0]],
                     "lang": observation["instruction"][0],
                     "state": observation["observation.state"].astype(np.float32, copy=False),
                 }
+                wrist_obs = observation.get("observation.wrist_image", None)
+                if wrist_obs is not None:
+                    example_dict["wrist_image"] = [wrist_obs[0]]
 
                 
                 start_time = time.time()

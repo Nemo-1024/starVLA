@@ -3,8 +3,8 @@
 Build a LeRobot v3.0-style dataset from raw human egocentric videos.
 
 The generated dataset uses a single state/action key:
-  - state.xyz_rotation_6d_gripper (10-dim)
-  - action.xyz_rotation_6d_gripper (10-dim)
+  - state.dummy_state (14-dim, bimanual: 2 x 7)
+  - action.dummy_action (14-dim, bimanual: 2 x 7)
 
 State/action values are filled with zeros by default.
 """
@@ -26,8 +26,8 @@ import pandas as pd
 from tqdm import tqdm
 
 
-STATE_KEY = "state.xyz_rotation_6d_gripper"
-ACTION_KEY = "action.xyz_rotation_6d_gripper"
+DEFAULT_STATE_MODALITY_NAME = "dummy_state"
+DEFAULT_ACTION_MODALITY_NAME = "dummy_action"
 VIDEO_KEY = "video.primary_view"
 DEFAULT_VIDEO_EXTENSIONS = (
     ".mp4",
@@ -69,14 +69,50 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--state_modality_name",
         type=str,
-        default="xyz_rotation_6d_gripper",
+        default=DEFAULT_STATE_MODALITY_NAME,
         help="State subkey name in modality.json, e.g. dummy_state.",
     )
     parser.add_argument(
         "--action_modality_name",
         type=str,
-        default="xyz_rotation_6d_gripper",
+        default=DEFAULT_ACTION_MODALITY_NAME,
         help="Action subkey name in modality.json, e.g. dummy_action.",
+    )
+    parser.add_argument(
+        "--state_key",
+        type=str,
+        default=f"state.{DEFAULT_STATE_MODALITY_NAME}",
+        help="Actual parquet/info key for state vectors, e.g. state.dummy_state.",
+    )
+    parser.add_argument(
+        "--action_key",
+        type=str,
+        default=f"action.{DEFAULT_ACTION_MODALITY_NAME}",
+        help="Actual parquet/info key for action vectors, e.g. action.dummy_action.",
+    )
+    parser.add_argument(
+        "--state_dim",
+        type=int,
+        default=None,
+        help="State vector dim. Default is inferred from key type and bimanual settings.",
+    )
+    parser.add_argument(
+        "--action_dim",
+        type=int,
+        default=None,
+        help="Action vector dim. Default is inferred from key type and bimanual settings.",
+    )
+    parser.add_argument(
+        "--num_arms",
+        type=int,
+        default=2,
+        help="Number of robot arms. Default is 2 (bimanual).",
+    )
+    parser.add_argument(
+        "--per_arm_dim",
+        type=int,
+        default=7,
+        help="Per-arm vector dim (e.g. xyz + rotvec + gripper = 7).",
     )
     parser.add_argument(
         "--copy_mode",
@@ -373,24 +409,40 @@ def _place_video(
     return 0
 
 
-def _build_modality_json(state_modality_name: str, action_modality_name: str) -> dict:
+def _infer_vector_dim(name_hint: str, fallback: int) -> int:
+    lowered = name_hint.lower()
+    if "rotation_6d" in lowered or "rot6d" in lowered:
+        return 10
+    if "rotvec" in lowered or "axis_angle" in lowered:
+        return 7
+    return fallback
+
+
+def _build_modality_json(
+    state_modality_name: str,
+    action_modality_name: str,
+    state_key: str,
+    action_key: str,
+    state_dim: int,
+    action_dim: int,
+) -> dict:
     return {
         "state": {
             state_modality_name: {
                 "start": 0,
-                "end": 10,
+                "end": state_dim,
                 "absolute": True,
                 "dtype": "float32",
-                "original_key": STATE_KEY,
+                "original_key": state_key,
             }
         },
         "action": {
             action_modality_name: {
                 "start": 0,
-                "end": 10,
+                "end": action_dim,
                 "absolute": True,
                 "dtype": "float32",
-                "original_key": ACTION_KEY,
+                "original_key": action_key,
             }
         },
         "video": {
@@ -444,6 +496,10 @@ def _weighted_index_quantile(lengths: list[int], q: float) -> int:
 def _build_stats_json(
     episode_lengths: list[int],
     episode_fps: list[float],
+    state_key: str,
+    action_key: str,
+    state_dim: int,
+    action_dim: int,
 ) -> dict:
     total_episodes = len(episode_lengths)
     total_frames = int(sum(episode_lengths))
@@ -501,22 +557,31 @@ def _build_stats_json(
         "q01": [0.0],
         "q99": [0.0],
     }
-    zero_vec = [0.0] * 10
-    zero_vec_stats = {
-        "mean": zero_vec,
-        "std": zero_vec,
-        "min": zero_vec,
-        "max": zero_vec,
-        "q01": zero_vec,
-        "q99": zero_vec,
+    zero_state_vec = [0.0] * state_dim
+    zero_action_vec = [0.0] * action_dim
+    zero_state_stats = {
+        "mean": zero_state_vec,
+        "std": zero_state_vec,
+        "min": zero_state_vec,
+        "max": zero_state_vec,
+        "q01": zero_state_vec,
+        "q99": zero_state_vec,
+    }
+    zero_action_stats = {
+        "mean": zero_action_vec,
+        "std": zero_action_vec,
+        "min": zero_action_vec,
+        "max": zero_action_vec,
+        "q01": zero_action_vec,
+        "q99": zero_action_vec,
     }
 
     return {
         "episode_index": episode_index_stats,
         "timestamp": timestamp_stats,
         "task_index": task_index_stats,
-        STATE_KEY: zero_vec_stats,
-        ACTION_KEY: zero_vec_stats,
+        state_key: zero_state_stats,
+        action_key: zero_action_stats,
     }
 
 
@@ -527,6 +592,10 @@ def _build_info_json(
     height: int,
     fps: float,
     video_codec: str,
+    state_key: str,
+    action_key: str,
+    state_dim: int,
+    action_dim: int,
 ) -> dict:
     return {
         "codebase_version": "v3.0",
@@ -544,13 +613,13 @@ def _build_info_json(
         "data_path": "data/chunk-{chunk_index:03d}/episode_{file_index:06d}.parquet",
         "video_path": "videos/chunk-{chunk_index:03d}/{video_key}/episode_{file_index:06d}.mp4",
         "features": {
-            STATE_KEY: {
+            state_key: {
                 "dtype": "float32",
-                "shape": [10],
+                "shape": [state_dim],
             },
-            ACTION_KEY: {
+            action_key: {
                 "dtype": "float32",
-                "shape": [10],
+                "shape": [action_dim],
             },
             VIDEO_KEY: {
                 "dtype": "video",
@@ -573,6 +642,27 @@ def _build_info_json(
 
 def main() -> None:
     args = _parse_args()
+    state_key = args.state_key
+    action_key = args.action_key
+    if args.num_arms <= 0 or args.per_arm_dim <= 0:
+        raise ValueError(
+            f"--num_arms/--per_arm_dim must be > 0, got {args.num_arms}/{args.per_arm_dim}"
+        )
+    base_state_dim = _infer_vector_dim(state_key, fallback=args.per_arm_dim)
+    base_action_dim = _infer_vector_dim(action_key, fallback=args.per_arm_dim)
+    state_dim = (
+        int(args.state_dim)
+        if args.state_dim is not None
+        else base_state_dim * int(args.num_arms)
+    )
+    action_dim = (
+        int(args.action_dim)
+        if args.action_dim is not None
+        else base_action_dim * int(args.num_arms)
+    )
+    if state_dim <= 0 or action_dim <= 0:
+        raise ValueError(f"--state_dim/--action_dim must be > 0, got {state_dim}/{action_dim}")
+
     video_extensions = _parse_video_extensions(args.video_extensions)
     videos = _collect_videos(args.raw_video_dir, video_extensions)
     if args.max_videos is not None:
@@ -661,14 +751,15 @@ def main() -> None:
             raise RuntimeError(f"No frames were written for {src_video}")
 
         timestamps = (np.arange(frame_count, dtype=np.float64) / fps).tolist()
-        zeros = [np.zeros(10, dtype=np.float32) for _ in range(frame_count)]
+        state_zeros = [np.zeros(state_dim, dtype=np.float32) for _ in range(frame_count)]
+        action_zeros = [np.zeros(action_dim, dtype=np.float32) for _ in range(frame_count)]
         frame_df = pd.DataFrame(
             {
                 "episode_index": np.full(frame_count, episode_index, dtype=np.int64),
                 "timestamp": timestamps,
                 "task_index": np.zeros(frame_count, dtype=np.int64),
-                STATE_KEY: zeros,
-                ACTION_KEY: zeros,
+                state_key: state_zeros,
+                action_key: action_zeros,
             }
         )
         frame_df.to_parquet(
@@ -710,6 +801,10 @@ def main() -> None:
     modality_json = _build_modality_json(
         state_modality_name=args.state_modality_name,
         action_modality_name=args.action_modality_name,
+        state_key=state_key,
+        action_key=action_key,
+        state_dim=state_dim,
+        action_dim=action_dim,
     )
     with open(args.output_dataset_dir / "meta" / "modality.json", "w", encoding="utf-8") as f:
         json.dump(modality_json, f, indent=2)
@@ -721,6 +816,10 @@ def main() -> None:
         height=first_height,
         fps=first_fps,
         video_codec=first_codec,
+        state_key=state_key,
+        action_key=action_key,
+        state_dim=state_dim,
+        action_dim=action_dim,
     )
     with open(args.output_dataset_dir / "meta" / "info.json", "w", encoding="utf-8") as f:
         json.dump(info_json, f, indent=2)
@@ -728,6 +827,10 @@ def main() -> None:
         stats_json = _build_stats_json(
             episode_lengths=episode_lengths,
             episode_fps=episode_fps,
+            state_key=state_key,
+            action_key=action_key,
+            state_dim=state_dim,
+            action_dim=action_dim,
         )
         with open(args.output_dataset_dir / "meta" / "stats_gr00t.json", "w", encoding="utf-8") as f:
             json.dump(stats_json, f, indent=4)

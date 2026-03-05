@@ -7,6 +7,6 @@ from latent_action_model.data_loader.lerobot_datamodule import LeRobotDataModule
 cli = LightningCLI(
     VJEPA_LAM,
     LeRobotDataModule,
-    seed_everything_default=2026,
+    seed_everything_default=42,
     save_config_kwargs={"overwrite": True},
 )

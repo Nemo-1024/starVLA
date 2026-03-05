@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import re
-from typing import List, Sequence, Tuple, Union, cast
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
 
-from .types import LiberoExample, LatentWorldPolicyInferBatch, LatentWorldPolicyTrainBatch
+from .types import (
+    LatentWorldPolicyInferBatch,
+    LatentWorldPolicyInferExample,
+    LatentWorldPolicyTrainBatch,
+    LatentWorldPolicyTrainExample,
+)
 
 MAX_SOURCE_ASPECT = 4.0 / 3.0
 
@@ -43,11 +48,15 @@ def _numpy_video_to_tchw_float(video_frames: Sequence[np.ndarray], target_hw: Tu
         pil_frame = _preprocess_numpy_frame_to_pil(frame, target_hw=target_hw)
         frame_arrays.append(torch.from_numpy(np.asarray(pil_frame)))
     video_thwc = torch.stack(frame_arrays, dim=0)  # [T, H, W, C], uint8
-    video_tchw = video_thwc.permute(0, 3, 1, 2).to(dtype=torch.float32).div_(255.0)
-    return video_tchw
+    return video_thwc.permute(0, 3, 1, 2).to(dtype=torch.float32).div_(255.0)
 
 
-class LatentWorldPolicyBatchBuilder:
+def _numpy_image_to_chw_float(frame: np.ndarray, target_hw: Tuple[int, int]) -> torch.Tensor:
+    pil_frame = _preprocess_numpy_frame_to_pil(frame, target_hw=target_hw)
+    return torch.from_numpy(np.asarray(pil_frame)).permute(2, 0, 1).to(dtype=torch.float32).div_(255.0)
+
+
+class _LatentWorldPolicyBatchBuilderBase:
     def __init__(
         self,
         *,
@@ -66,17 +75,6 @@ class LatentWorldPolicyBatchBuilder:
         language = language.lower()
         language = re.sub(r"[^\w\s]", "", language)
         return language
-
-    @staticmethod
-    def _sample_or_pad_sequence(seq: torch.Tensor, target_len: int) -> torch.Tensor:
-        if seq.shape[0] == target_len:
-            return seq
-        if seq.shape[0] > target_len:
-            idx = torch.linspace(0, seq.shape[0] - 1, target_len).round().long()
-            return seq.index_select(0, idx)
-        pad_len = target_len - seq.shape[0]
-        pad = seq[-1:].repeat(pad_len, 1)
-        return torch.cat([seq, pad], dim=0)
 
     @staticmethod
     def _align_feature_dim_with_mask(seq: torch.Tensor, target_dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -108,18 +106,73 @@ class LatentWorldPolicyBatchBuilder:
         return aligned, mask
 
     @staticmethod
-    def _sample_or_pad_sequence_with_mask(seq: torch.Tensor, target_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _infer_binary_gripper_dims(seq: torch.Tensor) -> torch.Tensor:
+        if seq.ndim != 2:
+            raise ValueError(f"Expected [T, D] tensor, got shape={tuple(seq.shape)}")
+        action_dim = int(seq.shape[1])
+        gripper_mask = torch.zeros((action_dim,), dtype=torch.bool, device=seq.device)
+        if action_dim == 7:
+            gripper_mask[6] = True
+            return gripper_mask
+        if action_dim == 14:
+            gripper_mask[6] = True
+            gripper_mask[13] = True
+            return gripper_mask
+        raise ValueError(
+            "Unsupported action feature dimension for gripper index inference. "
+            f"Expected D in {{7, 14}}, got D={action_dim}."
+        )
+
+    @staticmethod
+    def _downsample_action_by_factor2(seq: torch.Tensor, gripper_mask: torch.Tensor) -> torch.Tensor:
+        if seq.ndim != 2:
+            raise ValueError(f"Expected [T, D] tensor, got shape={tuple(seq.shape)}")
+        if gripper_mask.ndim != 1 or int(gripper_mask.shape[0]) != int(seq.shape[1]):
+            raise ValueError(
+                f"`gripper_mask` must be [D], got shape={tuple(gripper_mask.shape)} for D={int(seq.shape[1])}."
+            )
+
+        pair_count = int(seq.shape[0] // 2)
+        if pair_count == 0:
+            return seq[:0]
+
+        even_steps = seq[: pair_count * 2 : 2]
+        odd_steps = seq[1 : pair_count * 2 : 2]
+        downsampled = (even_steps + odd_steps) * 0.5
+
+        gripper_mask = gripper_mask.to(device=seq.device, dtype=torch.bool)
+        if bool(gripper_mask.any()):
+            downsampled = downsampled.clone()
+            downsampled[:, gripper_mask] = odd_steps[:, gripper_mask]
+        return downsampled
+
+    @staticmethod
+    def _sample_or_pad_sequence_with_mask(
+        seq: torch.Tensor, target_len: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         if seq.shape[0] == target_len:
-            return seq, torch.ones((target_len,), dtype=torch.bool)
+            return seq, torch.ones((target_len,), dtype=torch.bool), False
+        was_downsampled = False
         if seq.shape[0] > target_len:
-            idx = torch.linspace(0, seq.shape[0] - 1, target_len).round().long()
-            return seq.index_select(0, idx), torch.ones((target_len,), dtype=torch.bool)
+            original_len = int(seq.shape[0])
+            gripper_mask = _LatentWorldPolicyBatchBuilderBase._infer_binary_gripper_dims(seq)
+            seq = _LatentWorldPolicyBatchBuilderBase._downsample_action_by_factor2(seq, gripper_mask)
+            was_downsampled = True
+            downsampled_len = int(seq.shape[0])
+            if downsampled_len > target_len:
+                raise ValueError(
+                    "Action sequence still exceeds configured action_horizon after fixed 2x downsampling. "
+                    f"original_len={original_len}, downsampled_len={downsampled_len}, target_len={int(target_len)}. "
+                    "Please increase `framework.action_model.action_horizon` or reduce data action window."
+                )
+            if downsampled_len == target_len:
+                return seq, torch.ones((target_len,), dtype=torch.bool), True
         pad_len = target_len - seq.shape[0]
         pad = seq[-1:].repeat(pad_len, 1)
         out = torch.cat([seq, pad], dim=0)
         mask = torch.zeros((target_len,), dtype=torch.bool)
         mask[: seq.shape[0]] = True
-        return out, mask
+        return out, mask, was_downsampled
 
     @staticmethod
     def _build_masks(
@@ -164,116 +217,142 @@ class LatentWorldPolicyBatchBuilder:
             )
         return tensor
 
-    def build_train_batch(self, examples: Sequence[LiberoExample]) -> LatentWorldPolicyTrainBatch:
-        return cast(LatentWorldPolicyTrainBatch, self._build_batch(examples, include_actions=True))
+    @staticmethod
+    def _extract_primary_frame(primary_image, *, ex_idx: int) -> np.ndarray:
+        if not isinstance(primary_image, (list, tuple)):
+            raise ValueError(
+                f"examples[{ex_idx}]['primary_image'] must be a list/tuple, got type={type(primary_image)}."
+            )
+        if len(primary_image) != 1:
+            raise ValueError(
+                f"examples[{ex_idx}]['primary_image'] must contain exactly 1 primary view, got {len(primary_image)}."
+            )
+        primary_frame = primary_image[0]
+        if not isinstance(primary_frame, np.ndarray):
+            raise ValueError(
+                f"examples[{ex_idx}]['primary_image'][0] must be np.ndarray, got type={type(primary_frame)}."
+            )
+        return primary_frame
 
-    def build_infer_batch(self, examples: Sequence[LiberoExample]) -> LatentWorldPolicyInferBatch:
-        return cast(LatentWorldPolicyInferBatch, self._build_batch(examples, include_actions=False))
+    @staticmethod
+    def _extract_wrist_frames(ex, *, ex_idx: int, required: bool) -> List[np.ndarray]:
+        if "wrist_image" not in ex:
+            if required:
+                raise ValueError(
+                    f"examples[{ex_idx}] missing required key 'wrist_image' "
+                    "when `framework.action_model.enable_wrist_view=true`."
+                )
+            return []
 
-    def _build_batch(
+        wrist_image = ex["wrist_image"]
+        if not isinstance(wrist_image, (list, tuple)):
+            raise ValueError(
+                f"examples[{ex_idx}]['wrist_image'] must be a list/tuple, got type={type(wrist_image)}."
+            )
+        if len(wrist_image) < 1:
+            raise ValueError(
+                f"examples[{ex_idx}]['wrist_image'] must contain at least 1 wrist view, got {len(wrist_image)}."
+            )
+
+        wrist_frames: List[np.ndarray] = []
+        for wrist_idx, wrist_frame in enumerate(wrist_image):
+            if not isinstance(wrist_frame, np.ndarray):
+                raise ValueError(
+                    f"examples[{ex_idx}]['wrist_image'][{wrist_idx}] must be np.ndarray, "
+                    f"got type={type(wrist_frame)}."
+                )
+            wrist_frames.append(wrist_frame)
+        return wrist_frames
+
+    def _build_qwen_inputs(
         self,
-        examples: Sequence[LiberoExample],
         *,
-        include_actions: bool,
-    ) -> Union[LatentWorldPolicyInferBatch, LatentWorldPolicyTrainBatch]:
+        image_views_batch: Sequence[Sequence[np.ndarray]],
+        wrist_image_views_batch: Sequence[Sequence[np.ndarray]],
+        instructions: Sequence[str],
+    ) -> dict[str, torch.Tensor]:
+        processed_image_views_batch: List[List[Image.Image]] = []
+        for image_views in image_views_batch:
+            processed_image_views_batch.append(
+                [_preprocess_numpy_frame_to_pil(frame, target_hw=self.lam_image_hw) for frame in image_views]
+            )
+
+        processed_wrist_image_views_batch: List[List[Image.Image]] = []
+        for image_views in wrist_image_views_batch:
+            processed_wrist_image_views_batch.append(
+                [_preprocess_numpy_frame_to_pil(frame, target_hw=self.lam_image_hw) for frame in image_views]
+            )
+
+        return self.policy_vlm_adapter.build_qwenvl_inputs(
+            images=processed_image_views_batch,
+            wrist_images=processed_wrist_image_views_batch,
+            instructions=instructions,
+        )
+
+
+class LatentWorldPolicyTrainBatchBuilder(_LatentWorldPolicyBatchBuilderBase):
+    def build_train_batch(self, examples: Sequence[LatentWorldPolicyTrainExample]) -> LatentWorldPolicyTrainBatch:
         enable_wrist_view = bool(self.policy_cfg.enable_wrist_view)
 
         image_views_batch: List[List[np.ndarray]] = []
+        wrist_image_views_batch: List[List[np.ndarray]] = []
         primary_video_seqs: List[List[np.ndarray]] = []
-        wrist_video_seqs: List[List[np.ndarray]] = []
         instructions: List[str] = []
         actions_list: List[torch.Tensor] = []
         states_list: List[torch.Tensor] = []
         embodiment_ids: List[int] = []
+        action_hz_list: List[float] = []
 
         for ex_idx, ex in enumerate(examples):
-            image_views = ex["image"]
+            for key in ("primary_image", "primary_video", "lang", "state", "action", "embodiment_id", "action_hz"):
+                if key not in ex:
+                    raise KeyError(f"training examples[{ex_idx}] missing required key '{key}'.")
+
             instruction = ex["lang"]
-            state_tensor = ex["state"]
-            embodiment_id = ex["embodiment_id"]
+            primary_frame = self._extract_primary_frame(ex["primary_image"], ex_idx=ex_idx)
 
-            # if not isinstance(instruction, str):
-            #     raise TypeError(f"examples[{ex_idx}]['lang'] must be str, got type={type(instruction)}.")
-            # instruction = self._formalize_language(instruction)
+            action_hz = float(ex["action_hz"])
+            if action_hz <= 0.0:
+                raise ValueError(f"training examples[{ex_idx}]['action_hz'] must be > 0, got {action_hz}.")
 
-            if not isinstance(image_views, (list, tuple)) or len(image_views) == 0:
+            embodiment_id = int(ex["embodiment_id"])
+            state_tensor = self._to_2d_sequence_tensor(ex["state"], field_name="state", ex_idx=ex_idx)
+            action_tensor = self._to_2d_sequence_tensor(ex["action"], field_name="action", ex_idx=ex_idx)
+
+            primary_video_views = ex["primary_video"]
+            if not isinstance(primary_video_views, (list, tuple)):
                 raise ValueError(
-                    f"examples[{ex_idx}]['image'] must be a non-empty list/tuple, got type={type(image_views)}."
+                    f"training examples[{ex_idx}]['primary_video'] must be a list/tuple, "
+                    f"got type={type(primary_video_views)}."
+                )
+            if len(primary_video_views) != 1:
+                raise ValueError(
+                    f"training examples[{ex_idx}]['primary_video'] must contain exactly 1 primary view, "
+                    f"got {len(primary_video_views)}."
+                )
+            primary_video_seq = primary_video_views[0]
+            if not isinstance(primary_video_seq, (list, tuple)) or len(primary_video_seq) == 0:
+                raise ValueError(
+                    f"training examples[{ex_idx}] primary video sequence must be non-empty, "
+                    f"got type={type(primary_video_seq)}."
                 )
 
-            action_tensor = None
-            if include_actions:
-                if "action" not in ex:
-                    raise KeyError(f"examples[{ex_idx}] missing required key 'action' for training.")
-                action_tensor = self._to_2d_sequence_tensor(ex["action"], field_name="action", ex_idx=ex_idx)
+            wrist_frames = self._extract_wrist_frames(ex, ex_idx=ex_idx, required=enable_wrist_view)
 
-            video_views = None
-            if "primary_videos" in ex:
-                video_views = ex["primary_videos"]
-            elif "video" in ex:
-                video_views = ex["video"]
-
-            if video_views is None:
-                if include_actions:
-                    raise KeyError(
-                        f"examples[{ex_idx}] missing required key 'primary_videos'/'video' for training."
-                    )
-                primary_video_seq = [image_views[0]]
-            else:
-                if not isinstance(video_views, (list, tuple)) or len(video_views) == 0:
-                    raise ValueError(
-                        f"examples[{ex_idx}] video views must be a non-empty list/tuple, got type={type(video_views)}."
-                    )
-                primary_video_seq = video_views[0]
-                if not isinstance(primary_video_seq, (list, tuple)) or len(primary_video_seq) == 0:
-                    raise ValueError(
-                        f"examples[{ex_idx}] primary video sequence must be non-empty, got type={type(primary_video_seq)}."
-                    )
-
-            if enable_wrist_view:
-                if "wrist_images" not in ex:
-                    raise ValueError(
-                        f"examples[{ex_idx}] missing required key 'wrist_images' "
-                        "when `framework.action_model.enable_wrist_view=true`."
-                    )
-                wrist_images = ex["wrist_images"]
-                if not isinstance(wrist_images, (list, tuple)):
-                    raise ValueError(
-                        f"examples[{ex_idx}]['wrist_images'] must be a list/tuple, got type={type(wrist_images)}."
-                    )
-                if len(wrist_images) != 1:
-                    raise ValueError(
-                        f"examples[{ex_idx}]['wrist_images'] must contain exactly 1 wrist view, got {len(wrist_images)}."
-                    )
-                wrist_frame = wrist_images[0]
-                if not isinstance(wrist_frame, np.ndarray):
-                    raise ValueError(
-                        f"examples[{ex_idx}]['wrist_images'][0] must be np.ndarray, got type={type(wrist_frame)}."
-                    )
-                wrist_video_seqs.append([wrist_frame])
-
-            image_views_batch.append(image_views)
+            image_views_batch.append([primary_frame])
+            wrist_image_views_batch.append(wrist_frames)
             primary_video_seqs.append(list(primary_video_seq))
             instructions.append(instruction)
-            if include_actions:
-                assert action_tensor is not None
-                actions_list.append(action_tensor)
-            states_list.append(self._to_2d_sequence_tensor(state_tensor, field_name="state", ex_idx=ex_idx))
+            actions_list.append(action_tensor)
+            states_list.append(state_tensor)
             embodiment_ids.append(embodiment_id)
+            action_hz_list.append(action_hz)
 
-        processed_image_views_batch: List[List[Image.Image]] = []
-        for image_views in image_views_batch:
-            processed_image_views = [
-                _preprocess_numpy_frame_to_pil(frame, target_hw=self.lam_image_hw)
-                for frame in image_views
-            ]
-            processed_image_views_batch.append(processed_image_views)
-
-        qwen_inputs = self.policy_vlm_adapter.build_qwenvl_inputs(
-            images=processed_image_views_batch,
+        qwen_inputs = self._build_qwen_inputs(
+            image_views_batch=image_views_batch,
+            wrist_image_views_batch=wrist_image_views_batch,
             instructions=instructions,
         )
-
         input_ids = qwen_inputs["input_ids"]
         act_mask, flow_mask = self._build_masks(
             input_ids,
@@ -285,7 +364,6 @@ class LatentWorldPolicyBatchBuilder:
         action_dim = int(self.policy_cfg.flow_cfg.action_dim)
         window_size = int(self.policy_cfg.action_horizon)
         state_dim = int(self.policy_cfg.flow_cfg.state_dim)
-        lam_num_frames = int(self.policy_backend.lam.num_frames)
 
         action_tensors = []
         action_masks = []
@@ -293,56 +371,137 @@ class LatentWorldPolicyBatchBuilder:
         state_masks = []
 
         for idx, state_tensor in enumerate(states_list):
-            if include_actions:
-                action_tensor = actions_list[idx]
-                action_tensor, action_dim_mask = self._align_feature_dim_with_mask(action_tensor, action_dim)
-                action_tensor, action_time_mask = self._sample_or_pad_sequence_with_mask(action_tensor, window_size)
-                action_mask = action_time_mask.unsqueeze(1) & action_dim_mask.unsqueeze(0)
-                action_tensors.append(action_tensor)
-                action_masks.append(action_mask)
+            action_tensor = actions_list[idx]
+            action_tensor, action_dim_mask = self._align_feature_dim_with_mask(action_tensor, action_dim)
+            action_tensor, action_time_mask, was_downsampled = self._sample_or_pad_sequence_with_mask(action_tensor, window_size)
+            if was_downsampled:
+                action_hz_list[idx] *= 0.5
+            action_tensors.append(action_tensor)
+            action_masks.append(action_time_mask.unsqueeze(1) & action_dim_mask.unsqueeze(0))
 
-            state_tensor, state_dim_mask = self._align_feature_dim_with_mask(state_tensor, state_dim)
-            state_seq = self._sample_or_pad_sequence(state_tensor, lam_num_frames)
-            state_tensors.append(state_seq[-1])
+            aligned_state, state_dim_mask = self._align_feature_dim_with_mask(state_tensor, state_dim)
+            state_tensors.append(aligned_state[-1])
             state_masks.append(state_dim_mask)
 
-        primary_tensors = []
-        for primary_video_seq in primary_video_seqs:
-            primary_video_tchw = _numpy_video_to_tchw_float(primary_video_seq, target_hw=self.lam_image_hw)
-            primary_tensors.append(primary_video_tchw)
+        primary_video_tensors = [
+            _numpy_video_to_tchw_float(primary_video_seq, target_hw=self.lam_image_hw)
+            for primary_video_seq in primary_video_seqs
+        ]
 
-        lam_videos = torch.stack(primary_tensors, dim=0)
-        state = torch.stack(state_tensors, dim=0)
-        state_mask = torch.stack(state_masks, dim=0)
-
-        wrist_videos = None
-        if enable_wrist_view:
-            wrist_tensors = []
-            for wrist_video_seq in wrist_video_seqs:
-                wrist_video_tchw = _numpy_video_to_tchw_float(wrist_video_seq, target_hw=self.lam_image_hw)
-                wrist_tensors.append(wrist_video_tchw)
-            wrist_videos = torch.stack(wrist_tensors, dim=0)
-
-        infer_batch: LatentWorldPolicyInferBatch = {
+        batch: LatentWorldPolicyTrainBatch = {
             "pixel_values": qwen_inputs["pixel_values"],
             "input_ids": input_ids,
             "attention_mask": qwen_inputs["attention_mask"],
             "act_placeholder_mask": act_mask,
             "flow_placeholder_mask": flow_mask,
-            "lam_videos": lam_videos,
-            "state": state,
-            "state_mask": state_mask,
+            "primary_video": torch.stack(primary_video_tensors, dim=0),
+            "state": torch.stack(state_tensors, dim=0),
+            "state_mask": torch.stack(state_masks, dim=0),
             "embodiment_id": torch.tensor(embodiment_ids, dtype=torch.long),
+            "action_hz": torch.tensor(action_hz_list, dtype=torch.float32),
             "image_grid_thw": qwen_inputs.get("image_grid_thw"),
-            "wrist_videos": wrist_videos,
+            "actions": torch.stack(action_tensors, dim=0),
+            "actions_mask": torch.stack(action_masks, dim=0),
         }
+        if not torch.is_tensor(batch["image_grid_thw"]):
+            batch["image_grid_thw"] = None
+        return batch
 
-        if not torch.is_tensor(infer_batch["image_grid_thw"]):
-            infer_batch["image_grid_thw"] = None
 
-        if include_actions:
-            train_batch = cast(LatentWorldPolicyTrainBatch, dict(infer_batch))
-            train_batch["actions"] = torch.stack(action_tensors, dim=0)
-            train_batch["actions_mask"] = torch.stack(action_masks, dim=0)
-            return train_batch
-        return infer_batch
+class LatentWorldPolicyInferBatchBuilder(_LatentWorldPolicyBatchBuilderBase):
+    _ALLOWED_INFER_KEYS = {
+        "lang",
+        "primary_image",
+        "action_hz",
+        "embodiment_id",
+        "state",
+        "wrist_image",
+    }
+    _REQUIRED_INFER_KEYS = {"lang", "primary_image", "action_hz", "embodiment_id"}
+
+    def build_infer_batch(self, examples: Sequence[LatentWorldPolicyInferExample]) -> LatentWorldPolicyInferBatch:
+        enable_wrist_view = bool(self.policy_cfg.enable_wrist_view)
+        state_dim = int(self.policy_cfg.flow_cfg.state_dim)
+
+        image_views_batch: List[List[np.ndarray]] = []
+        wrist_image_views_batch: List[List[np.ndarray]] = []
+        primary_image_tensors: List[torch.Tensor] = []
+        instructions: List[str] = []
+        state_tensors: List[torch.Tensor] = []
+        state_masks: List[torch.Tensor] = []
+        embodiment_ids: List[int] = []
+        action_hz_list: List[float] = []
+
+        for ex_idx, ex in enumerate(examples):
+            extra_keys = sorted(set(ex.keys()) - self._ALLOWED_INFER_KEYS)
+            if extra_keys:
+                raise KeyError(
+                    "inference examples[{idx}] contains unsupported keys {keys}. "
+                    "Allowed keys are: {allowed}.".format(
+                        idx=ex_idx,
+                        keys=extra_keys,
+                        allowed=sorted(self._ALLOWED_INFER_KEYS),
+                    )
+                )
+            missing_keys = sorted(self._REQUIRED_INFER_KEYS - set(ex.keys()))
+            if missing_keys:
+                raise KeyError(
+                    f"inference examples[{ex_idx}] missing required keys {missing_keys}. "
+                    f"Required keys are: {sorted(self._REQUIRED_INFER_KEYS)}."
+                )
+
+            instruction = ex["lang"]
+            primary_frame = self._extract_primary_frame(ex["primary_image"], ex_idx=ex_idx)
+            wrist_frames = self._extract_wrist_frames(ex, ex_idx=ex_idx, required=enable_wrist_view)
+
+            action_hz = float(ex["action_hz"])
+            if action_hz <= 0.0:
+                raise ValueError(f"inference examples[{ex_idx}]['action_hz'] must be > 0, got {action_hz}.")
+            embodiment_id = int(ex["embodiment_id"])
+
+            if "state" in ex:
+                state_seq = self._to_2d_sequence_tensor(ex["state"], field_name="state", ex_idx=ex_idx)
+                aligned_state, state_dim_mask = self._align_feature_dim_with_mask(state_seq, state_dim)
+                state_tensors.append(aligned_state[-1])
+                state_masks.append(state_dim_mask)
+            else:
+                state_tensors.append(torch.zeros((state_dim,), dtype=torch.float32))
+                state_masks.append(torch.zeros((state_dim,), dtype=torch.bool))
+
+            image_views_batch.append([primary_frame])
+            wrist_image_views_batch.append(wrist_frames)
+            primary_image_tensors.append(_numpy_image_to_chw_float(primary_frame, target_hw=self.lam_image_hw))
+            instructions.append(instruction)
+            embodiment_ids.append(embodiment_id)
+            action_hz_list.append(action_hz)
+
+        qwen_inputs = self._build_qwen_inputs(
+            image_views_batch=image_views_batch,
+            wrist_image_views_batch=wrist_image_views_batch,
+            instructions=instructions,
+        )
+
+        input_ids = qwen_inputs["input_ids"]
+        act_mask, flow_mask = self._build_masks(
+            input_ids,
+            act_queries=int(self.policy_backend.num_action_queries),
+            flow_queries=int(self.policy_backend.flow.flow_action_query.shape[0]),
+            placeholder_id=int(self.policy_backend.placeholder_token_id),
+        )
+
+        batch: LatentWorldPolicyInferBatch = {
+            "pixel_values": qwen_inputs["pixel_values"],
+            "input_ids": input_ids,
+            "attention_mask": qwen_inputs["attention_mask"],
+            "act_placeholder_mask": act_mask,
+            "flow_placeholder_mask": flow_mask,
+            "primary_image": torch.stack(primary_image_tensors, dim=0),
+            "state": torch.stack(state_tensors, dim=0),
+            "state_mask": torch.stack(state_masks, dim=0),
+            "embodiment_id": torch.tensor(embodiment_ids, dtype=torch.long),
+            "action_hz": torch.tensor(action_hz_list, dtype=torch.float32),
+            "image_grid_thw": qwen_inputs.get("image_grid_thw"),
+        }
+        if not torch.is_tensor(batch["image_grid_thw"]):
+            batch["image_grid_thw"] = None
+        return batch

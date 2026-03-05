@@ -12,15 +12,24 @@ ImageViews = Sequence[FrameArray]
 VideoViews = Sequence[Sequence[FrameArray]]
 
 
-class LiberoExample(TypedDict, total=False):
-    image: Required[ImageViews]
+class LatentWorldPolicyTrainExample(TypedDict, total=False):
+    primary_image: Required[ImageViews]
+    primary_video: Required[VideoViews]
     lang: Required[str]
     state: Required[TensorLike2D]
+    action: Required[TensorLike2D]
     embodiment_id: Required[int]
-    action: NotRequired[TensorLike2D]
-    primary_videos: NotRequired[VideoViews]
-    video: NotRequired[VideoViews]
-    wrist_images: NotRequired[ImageViews]
+    action_hz: Required[float]
+    wrist_image: NotRequired[ImageViews]
+
+
+class LatentWorldPolicyInferExample(TypedDict, total=False):
+    primary_image: Required[ImageViews]
+    lang: Required[str]
+    embodiment_id: Required[int]
+    action_hz: Required[float]
+    state: NotRequired[TensorLike2D]
+    wrist_image: NotRequired[ImageViews]
 
 
 class LatentWorldPolicyInferBatch(TypedDict):
@@ -29,14 +38,25 @@ class LatentWorldPolicyInferBatch(TypedDict):
     attention_mask: torch.Tensor
     act_placeholder_mask: torch.Tensor
     flow_placeholder_mask: torch.Tensor
-    lam_videos: torch.Tensor
+    primary_image: torch.Tensor
     state: torch.Tensor
     state_mask: torch.Tensor
     embodiment_id: torch.Tensor
+    action_hz: torch.Tensor
     image_grid_thw: Optional[torch.Tensor]
-    wrist_videos: Optional[torch.Tensor]
 
 
-class LatentWorldPolicyTrainBatch(LatentWorldPolicyInferBatch):
+class LatentWorldPolicyTrainBatch(TypedDict):
+    pixel_values: torch.Tensor
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    act_placeholder_mask: torch.Tensor
+    flow_placeholder_mask: torch.Tensor
+    primary_video: torch.Tensor
+    state: torch.Tensor
+    state_mask: torch.Tensor
+    embodiment_id: torch.Tensor
+    action_hz: torch.Tensor
+    image_grid_thw: Optional[torch.Tensor]
     actions: torch.Tensor
     actions_mask: torch.Tensor

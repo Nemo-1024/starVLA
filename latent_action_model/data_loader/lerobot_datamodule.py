@@ -39,6 +39,7 @@ class LeRobotDataModule(LightningDataModule):
         *,
         # Physical-time sampling interval in seconds (required).
         frame_dt_sec: float,
+        human_frame_dt_sec: Optional[float] = None,
         batch_size: int = 4,
         num_workers: int = 4,
         prefetch_factor: Optional[int] = None,  # None = DataLoader default(2). 若 CPU 成瓶颈可调大(如 8) 或减小 num_workers(如 2)
@@ -46,13 +47,20 @@ class LeRobotDataModule(LightningDataModule):
         pin_memory: bool = False,
         persistent_workers: bool = False,
         debug_repeat_batch: Union[bool, int] = False,
-        max_state_dim: int = 32,  # Maximum proprio dimension for padding
+        val_tail_ratio: float = 0.001,
+        max_state_dim: int = 14,  # Maximum proprio dimension for padding
     ):
         super().__init__()
         if num_frames < 1:
             raise ValueError(f"num_frames must be >= 1, got {num_frames}")
         if frame_dt_sec <= 0:
             raise ValueError(f"frame_dt_sec must be > 0, got {frame_dt_sec}")
+        if human_frame_dt_sec is not None and human_frame_dt_sec <= 0:
+            raise ValueError(
+                f"human_frame_dt_sec must be > 0 when provided, got {human_frame_dt_sec}"
+            )
+        if not (0.0 <= float(val_tail_ratio) < 1.0):
+            raise ValueError(f"val_tail_ratio must be in [0.0, 1.0), got {val_tail_ratio}")
 
         self.data_root_dir = data_root_dir
         self.data_mix = data_mix
@@ -61,6 +69,7 @@ class LeRobotDataModule(LightningDataModule):
         self.preferred_video_key = preferred_video_key
         self.state_keys = state_keys
         self.frame_dt_sec = frame_dt_sec
+        self.human_frame_dt_sec = human_frame_dt_sec
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor
@@ -68,6 +77,7 @@ class LeRobotDataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
         self.debug_repeat_batch = debug_repeat_batch
+        self.val_tail_ratio = float(val_tail_ratio)
         self.max_state_dim = max_state_dim
 
         self.train_dataset = None
@@ -79,14 +89,32 @@ class LeRobotDataModule(LightningDataModule):
                 data_root_dir=self.data_root_dir,
                 data_mix=self.data_mix,
                 num_frames=self.num_frames,
+                mode="train",
+                val_tail_ratio=self.val_tail_ratio,
                 video_backend=self.video_backend,
                 preferred_video_key=self.preferred_video_key,
                 state_keys=self.state_keys,
                 frame_dt_sec=self.frame_dt_sec,
+                human_frame_dt_sec=self.human_frame_dt_sec,
                 debug_repeat_batch=self.debug_repeat_batch,
             )
-            # 简化：验证集复用训练数据
-            # self.val_dataset = self.train_dataset
+        if stage in (None, "fit", "validate"):
+            if self.val_tail_ratio > 0:
+                self.val_dataset = LeRobotLAMDataset(
+                    data_root_dir=self.data_root_dir,
+                    data_mix=self.data_mix,
+                    num_frames=self.num_frames,
+                    mode="val",
+                    val_tail_ratio=self.val_tail_ratio,
+                    video_backend=self.video_backend,
+                    preferred_video_key=self.preferred_video_key,
+                    state_keys=self.state_keys,
+                    frame_dt_sec=self.frame_dt_sec,
+                    human_frame_dt_sec=self.human_frame_dt_sec,
+                    debug_repeat_batch=False,
+                )
+            else:
+                self.val_dataset = None
 
     def train_dataloader(self):
         # Use partial to pass max_state_dim to collate function
@@ -128,17 +156,23 @@ class LeRobotDataModule(LightningDataModule):
         """
         self.set_mixture_epoch(getattr(trainer, "current_epoch", 0))
 
-    # def val_dataloader(self):
-    #     # Use partial to pass max_state_dim to collate function
-    #     collate_fn = partial(lam_collate, max_state_dim=self.max_state_dim)
-        
-    #     return DataLoader(
-    #         self.val_dataset,
-    #         batch_size=self.batch_size,
-    #         num_workers=self.num_workers,
-    #         shuffle=False,
-    #         pin_memory=True,
-    #         collate_fn=collate_fn,
-    #         persistent_workers=self.num_workers > 0,
-    #         prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
-    #     )
+    def val_dataloader(self):
+        if self.val_dataset is None:
+            raise RuntimeError(
+                "Validation dataset is not initialized. Set data.val_tail_ratio > 0 to enable validation split."
+            )
+
+        collate_fn = partial(lam_collate, max_state_dim=self.max_state_dim)
+        use_persistent_workers = self.num_workers > 0 and self.persistent_workers
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            pin_memory=self.pin_memory,
+            collate_fn=collate_fn,
+            worker_init_fn=_lam_worker_init_fn if self.num_workers > 0 else None,
+            persistent_workers=use_persistent_workers,
+            prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
+            in_order=self.in_order if self.num_workers > 0 else True,
+        )

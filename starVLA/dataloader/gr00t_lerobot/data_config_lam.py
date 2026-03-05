@@ -42,7 +42,9 @@ def filter_lam_video_keys(
     preferred_video_key: str | None = None,
 ) -> list[str]:
     """
-    Keep only one non-wrist camera key for LAM to avoid decoding unused multi-view streams.
+    Keep all non-wrist camera keys for LAM.
+    Single non-wrist view selection is handled downstream by mixture sampling
+    policy.
     """
     filtered_video_keys = [key for key in base_video_keys if "wrist" not in key.lower()]
     if not filtered_video_keys:
@@ -53,14 +55,17 @@ def filter_lam_video_keys(
 
     if preferred_video_key is not None:
         if preferred_video_key in filtered_video_keys:
-            return [preferred_video_key]
+            # Keep all non-wrist keys, but place preferred key first.
+            return [preferred_video_key] + [
+                key for key in filtered_video_keys if key != preferred_video_key
+            ]
         if preferred_video_key in base_video_keys:
             raise ValueError(
                 f"Preferred video key '{preferred_video_key}' is filtered out because it is a wrist view. "
                 f"Available non-wrist keys: {filtered_video_keys}"
             )
 
-    return [filtered_video_keys[0]]
+    return filtered_video_keys
 
 
 def build_lam_state_normalize_transform(

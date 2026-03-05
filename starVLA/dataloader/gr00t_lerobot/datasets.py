@@ -64,6 +64,10 @@ LE_ROBOT_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 EPSILON = 5e-4
 
 
+def _is_main_process() -> bool:
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
 
 def _resolve_embodiment_id_from_tag(tag: str) -> int:
     if not isinstance(tag, str):
@@ -143,11 +147,12 @@ class LeRobotSingleDataset(Dataset):
         modality_configs: dict[str, ModalityConfig],
         embodiment_tag: str | EmbodimentTag,
         mode: str = "all",
-        _val_tail_ratio: float = 0.01,
+        _val_tail_ratio: float = 0.001,
         video_backend: str = "pyav",
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
         data_cfg = None,
+        action_hz: float | None = None,
         _force_recompute_stats: bool = False,
         **kwargs,
     ):
@@ -175,6 +180,7 @@ class LeRobotSingleDataset(Dataset):
                 self.data_cfg.get("force_recompute_stats", self._force_recompute_stats)
             )
         self.modality_configs = modality_configs
+        self._action_hz_hint = float(action_hz) if action_hz is not None else None
         self.video_backend = video_backend
         self.video_backend_kwargs = dict(video_backend_kwargs) if video_backend_kwargs is not None else {}
         # Never trust manually provided fixed_fps: always derive per-dataset fps from info.json metadata.
@@ -231,6 +237,7 @@ class LeRobotSingleDataset(Dataset):
         self._build_active_step_indexing()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
+        self._action_hz = self._resolve_action_hz()
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
@@ -290,6 +297,11 @@ class LeRobotSingleDataset(Dataset):
     def dataset_name(self) -> str:
         """The name of the dataset."""
         return self._dataset_name
+
+    @property
+    def action_hz(self) -> float:
+        """Per-dataset control frequency (Hz) for action timestamps."""
+        return float(self._action_hz)
 
     @property
     def lerobot_modality_meta(self) -> LeRobotModalityMetadata:
@@ -472,9 +484,9 @@ class LeRobotSingleDataset(Dataset):
         
             print(f"[RANK 0] Dataset statistics cached to {stats_path}")
         
-        # # ---------- sync ----------
-        # if dist.is_initialized():
-        #     dist.barrier()
+        # ---------- sync ----------
+        if dist.is_initialized():
+            dist.barrier()
         
         # ---------- all rank read again ----------
         if le_statistics is None:
@@ -530,8 +542,6 @@ class LeRobotSingleDataset(Dataset):
             if col.startswith("videos/") and col.endswith("/from_timestamp"):
                 vid_key = col.replace("videos/", "").replace("/from_timestamp", "")
                 self._detected_video_keys.append(vid_key)
-        if self._detected_video_keys:
-            print(f"[INFO] Video keys from episodes (official): {self._detected_video_keys}")
         return np.array(trajectory_ids), np.array(trajectory_lengths)
 
     def _build_mode_split_from_trajectories(self) -> None:
@@ -768,6 +778,46 @@ class LeRobotSingleDataset(Dataset):
                 delta_indices[key] = np.array(config.delta_indices)
         return delta_indices
 
+    def _resolve_action_hz(self) -> float:
+        """Resolve per-dataset action/control frequency from hint or metadata video fps."""
+        if self._action_hz_hint is not None:
+            if self._action_hz_hint <= 0:
+                raise ValueError(
+                    f"Invalid action_hz hint for dataset={self.dataset_name}: {self._action_hz_hint}"
+                )
+            return float(self._action_hz_hint)
+
+        fps_candidates: list[float] = []
+        for key in self.modality_keys.get("video", []):
+            meta_key = key.replace("video.", "", 1) if key.startswith("video.") else key
+            if meta_key in self.metadata.modalities.video:
+                fps = float(self.metadata.modalities.video[meta_key].fps)
+                if fps > 0:
+                    fps_candidates.append(fps)
+
+        if not fps_candidates:
+            for video_meta in self.metadata.modalities.video.values():
+                fps = float(video_meta.fps)
+                if fps > 0:
+                    fps_candidates.append(fps)
+
+        if not fps_candidates:
+            fallback = 10.0
+            print(
+                f"[LeRobotDataset] dataset={self.dataset_name} cannot resolve action_hz from metadata; "
+                f"fallback to {fallback} Hz."
+            )
+            return fallback
+
+        if len(fps_candidates) > 1:
+            unique_fps = sorted({round(v, 6) for v in fps_candidates})
+            if len(unique_fps) > 1:
+                print(
+                    f"[LeRobotDataset] dataset={self.dataset_name} has multiple video fps={unique_fps}; "
+                    f"use first={fps_candidates[0]} as action_hz."
+                )
+        return float(fps_candidates[0])
+
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
         """Get the metadata for the LeRobot dataset."""
         modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
@@ -978,12 +1028,14 @@ class LeRobotSingleDataset(Dataset):
             video=videos,
             language=language,
             embodiment_id=int(self.embodiment_id),
+            action_hz=float(self.action_hz),
         )
 
     def get_step_data(
         self,
         trajectory_id: int,
         base_index: int,
+        modality_keys_override: dict[str, list[str]] | None = None,
     ) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
 
@@ -1012,7 +1064,11 @@ class LeRobotSingleDataset(Dataset):
         """
         data: dict = {}
         self._set_curr_episode(trajectory_id)
-        modality_keys = self.modality_keys
+        modality_keys = {modality: list(keys) for modality, keys in self.modality_keys.items()}
+        if modality_keys_override:
+            for modality, keys in modality_keys_override.items():
+                if modality in modality_keys:
+                    modality_keys[modality] = list(keys)
         get_data = self.get_data_by_modality
         for modality, keys in modality_keys.items():
             for key in keys:
@@ -1147,9 +1203,9 @@ class LeRobotSingleDataset(Dataset):
         vals_arr = np.asarray(column_vals)
         if vals_arr.dtype != object:
             if vals_arr.ndim == 2:
-                return vals_arr[:, start:end]
+                return vals_arr[:, start:end].astype(np.float32, copy=False)
             if vals_arr.ndim == 1:
-                return vals_arr.reshape(-1, 1)[:, start:end]
+                return vals_arr.reshape(-1, 1)[:, start:end].astype(np.float32, copy=False)
 
         rows = []
         for val in column_vals:
@@ -1157,7 +1213,7 @@ class LeRobotSingleDataset(Dataset):
             if arr.ndim == 0:
                 arr = arr.reshape(1)
             rows.append(arr[start:end])
-        return np.stack(rows, axis=0)
+        return np.stack(rows, axis=0).astype(np.float32, copy=False)
 
 
     def retrieve_data_and_pad(
@@ -1637,6 +1693,7 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         self,
         trajectory_id: int,
         base_index: int,
+        modality_keys_override: dict[str, list[str]] | None = None,
     ) -> dict:
         """Get the RAW data for a single step. No transforms are applied.
 
@@ -1649,10 +1706,15 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         """
         data = {}
         self._set_curr_episode(trajectory_id)
+        modality_keys = {modality: list(keys) for modality, keys in self.modality_keys.items()}
+        if modality_keys_override:
+            for modality, keys in modality_keys_override.items():
+                if modality in modality_keys:
+                    modality_keys[modality] = list(keys)
         # Get the data for all modalities
-        for modality in self.modality_keys:
+        for modality in modality_keys:
             # Get the data corresponding to each key in the modality
-            for key in self.modality_keys[modality]:
+            for key in modality_keys[modality]:
                 data[key] = self.get_data_by_modality(
                     trajectory_id,
                     modality,
@@ -1796,6 +1858,7 @@ class LeRobotMixtureDataset(Dataset):
         mode: str,
         balance_dataset_weights: bool = True,
         seed: int = 42,
+        random_single_non_wrist_view: bool = True,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
         },
@@ -1829,6 +1892,8 @@ class LeRobotMixtureDataset(Dataset):
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
 
+        self.random_single_non_wrist_view = random_single_non_wrist_view
+
         # Set properties for sampling
 
         # 1. Dataset lengths
@@ -1836,7 +1901,8 @@ class LeRobotMixtureDataset(Dataset):
         print(f"Dataset lengths: {self._dataset_lengths}")
 
         # 2. Dataset sampling weights
-        self._dataset_sampling_weights = np.array(dataset_sampling_weights)
+        self._raw_dataset_sampling_weights = np.array(dataset_sampling_weights, dtype=np.float64)
+        self._dataset_sampling_weights = self._raw_dataset_sampling_weights.copy()
         
         if self.balance_dataset_weights:
             self._dataset_sampling_weights *= self._dataset_lengths
@@ -1854,7 +1920,9 @@ class LeRobotMixtureDataset(Dataset):
             # Fallback to equal weights
             self._dataset_sampling_weights = np.ones(len(self.datasets)) / len(self.datasets)
             print(f"Fallback to equal weights")
+            self._effective_dataset_sampling_weights = self._dataset_sampling_weights.copy()
         else:
+            self._effective_dataset_sampling_weights = self._dataset_sampling_weights.copy()
             self._dataset_sampling_weights /= weights_sum
 
         # 3. Primary dataset indices
@@ -1871,6 +1939,8 @@ class LeRobotMixtureDataset(Dataset):
             print("Error: Still no primary dataset found. Using first dataset as primary.")
             self._primary_dataset_indices = np.zeros(len(self.datasets), dtype=bool)
             self._primary_dataset_indices[0] = True
+
+        self._log_dataset_mixture_table()
 
         # Set the epoch and sample the first epoch
         self.set_epoch(0)
@@ -1902,6 +1972,40 @@ class LeRobotMixtureDataset(Dataset):
             dataset_descriptions.append(dataset_description)
         return json.dumps({"Mixture dataset": dataset_descriptions}, indent=2)
 
+    def _log_dataset_mixture_table(self) -> None:
+        if not _is_main_process():
+            return
+
+        headers = ["Idx", "Dataset", "Ratio(%)"]
+        rows: list[list[str]] = []
+
+        for idx, dataset in enumerate(self.datasets):
+            dataset_name = getattr(dataset, "dataset_name", str(dataset))
+            rows.append(
+                [
+                    str(idx),
+                    str(dataset_name),
+                    f"{float(self.dataset_sampling_weights[idx]) * 100.0:.2f}",
+                ]
+            )
+
+        col_widths = [
+            max(len(headers[col_idx]), *(len(row[col_idx]) for row in rows)) for col_idx in range(len(headers))
+        ]
+
+        def _format_row(values: list[str]) -> str:
+            return " | ".join(value.ljust(col_widths[col_idx]) for col_idx, value in enumerate(values))
+
+        sep = "-+-".join("-" * width for width in col_widths)
+        print(
+            f"[RANK 0] Dataset mixture ratios "
+            f"(balance_dataset_weights={self.balance_dataset_weights}):"
+        )
+        print(_format_row(headers))
+        print(sep)
+        for row in rows:
+            print(_format_row(row))
+
     def set_epoch(self, epoch: int):
         """Set the epoch for the dataset.
 
@@ -1917,9 +2021,7 @@ class LeRobotMixtureDataset(Dataset):
         Uses uniform sampling across all steps via hf_dataset absolute index,
         following the official LeRobot v3 approach.
         """
-        # Set seed
-        seed = index if self.mode != "train" else safe_hash((self.epoch, index, self.seed))
-        rng = np.random.default_rng(seed)
+        rng = self._create_rng(index)
 
         # Sample dataset based on dataset_sampling_weights
         dataset_index = rng.choice(len(self.datasets), p=self.dataset_sampling_weights)
@@ -1929,6 +2031,107 @@ class LeRobotMixtureDataset(Dataset):
         local_idx = rng.integers(0, len(dataset))
         trajectory_id, base_index = dataset.abs_index_to_episode_step(local_idx)
         return dataset, trajectory_id, base_index
+
+    def _create_rng(self, index: int, salt: str = "") -> np.random.Generator:
+        if self.mode != "train":
+            if salt:
+                seed = safe_hash((index, salt))
+            else:
+                seed = int(index)
+        else:
+            seed_tuple = (self.epoch, index, self.seed) if not salt else (self.epoch, index, self.seed, salt)
+            seed = safe_hash(seed_tuple)
+        return np.random.default_rng(seed)
+
+    def _get_retry_index(self, original_index: int, attempt: int, reason: str) -> int:
+        if len(self) <= 1:
+            return 0
+        rng = self._create_rng(original_index, salt=f"retry:{reason}:{attempt}")
+        return int(rng.integers(0, len(self)))
+
+    def _select_video_keys_for_sample(self, dataset: LeRobotSingleDataset, index: int) -> list[str]:
+        all_video_keys = list(dataset.modality_keys.get("video", []))
+        if not self.random_single_non_wrist_view or len(all_video_keys) <= 1:
+            return all_video_keys
+
+        non_wrist_keys = [k for k in all_video_keys if "wrist" not in k.lower()]
+        if len(non_wrist_keys) <= 1:
+            return all_video_keys
+
+        rng = self._create_rng(index, salt="view_select")
+        chosen_non_wrist = non_wrist_keys[int(rng.integers(0, len(non_wrist_keys)))]
+        selected_keys = {chosen_non_wrist}
+        for key in all_video_keys:
+            if "wrist" in key.lower():
+                selected_keys.add(key)
+        # Preserve original key order from modality config.
+        return [k for k in all_video_keys if k in selected_keys]
+
+    def _sample_candidate(
+        self,
+        index: int,
+        max_video_retries: int,
+    ) -> tuple[LeRobotSingleDataset, int, int, list[str]]:
+        current_index = int(index)
+        for video_retry in range(max_video_retries):
+            dataset, trajectory_id, step = self.sample_step(current_index)
+            selected_video_keys = self._select_video_keys_for_sample(dataset, current_index)
+            if not selected_video_keys:
+                raise ValueError(f"Dataset {dataset.dataset_name} has no video keys configured.")
+            key = selected_video_keys[0].replace("video.", "")
+            video_path = dataset.get_video_path(trajectory_id, key)
+            if os.path.exists(video_path):
+                return dataset, trajectory_id, step, selected_video_keys
+            current_index = self._get_retry_index(index, video_retry, reason="missing_video")
+        raise FileNotFoundError(f"Failed to find valid video path after {max_video_retries} attempts for index {index}.")
+
+    def _build_output_sample(
+        self,
+        dataset: LeRobotSingleDataset,
+        data: dict,
+        selected_video_keys: list[str],
+    ) -> dict:
+        # Process all video keys dynamically:
+        # - Primary views: keep full video sequence for LAM + first frame for VLM.
+        # - Wrist views: keep first frame only; LatentWorld batch builder promotes it to T=1 wrist_videos.
+        prim_images = []
+        wrist_images = []
+        prim_videos = []
+        for video_key in selected_video_keys:
+            view_frames = data[video_key]
+            if view_frames.ndim != 4:
+                raise ValueError(
+                    f"Expected video array shape [T, H, W, C] for key={video_key}, got {view_frames.shape}"
+                )
+            if "wrist" not in video_key:
+                prim_images.append(view_frames[0])
+                prim_videos.append(list(view_frames))
+            else:
+                # Wrist view is consumed as a single image only; avoid converting the full sequence.
+                wrist_images.append(view_frames[0])
+        all_images = prim_images + wrist_images
+
+        # Get language and state/action data from transform outputs
+        language = data[dataset.modality_keys["language"][0]][0]
+        missing_action_keys = [key for key in ["action"] if key not in data]
+        if missing_action_keys:
+            raise KeyError(
+                f"Missing required transformed keys {missing_action_keys} for dataset "
+                f"{dataset.dataset_name}. Ensure action transforms and concat are configured."
+            )
+        action = data["action"]
+
+        return dict(
+            action=action,
+            image=all_images,
+            primary_image=prim_images,
+            wrist_image=wrist_images,
+            primary_video=prim_videos,
+            lang=language,
+            state=data["state"],
+            embodiment_id=int(dataset.embodiment_id),
+            action_hz=float(dataset.action_hz),
+        )
 
     def __getitem__(self, index: int) -> dict:
         """Get the data for a single trajectory and start index.
@@ -1941,78 +2144,34 @@ class LeRobotMixtureDataset(Dataset):
         """
         max_retries = 10
         last_exception = None
+        current_index = int(index)
         
         for attempt in range(max_retries):
             try:
-                while True: # @DUG
-                    dataset, trajectory_id, step = self.sample_step(index)
-                    key = dataset.modality_keys["video"][0].replace("video.", "")
-                    video_path = dataset.get_video_path(trajectory_id, key)
-                    if os.path.exists(video_path):
-                        break
-                    index = random.randint(0, len(self) - 1)
-                    
-                raw_data = dataset.get_step_data(trajectory_id, step)    
-                data = dataset.transforms(raw_data)
-                
-                # Process all video keys dynamically:
-                # - Primary views: keep full video sequence for LAM + first frame for VLM.
-                # - Wrist views: keep first frame only; LatentWorld batch builder promotes it to T=1 wrist_videos.
-                prim_images = []
-                wrist_images = []
-                prim_videos = []
-                for video_key in dataset.modality_keys["video"]:
-                    view_frames = data[video_key]
-                    if view_frames.ndim != 4:
-                        raise ValueError(
-                            f"Expected video array shape [T, H, W, C] for key={video_key}, got {view_frames.shape}"
-                        )
-                    if "wrist" not in video_key:
-                        prim_images.append(view_frames[0])
-                        prim_videos.append(list(view_frames))
-                    else:
-                        # Wrist view is consumed as a single image only; avoid converting the full sequence.
-                        wrist_images.append(view_frames[0])
-                all_images = prim_images + wrist_images
-                all_videos = prim_videos
-                
-                # Get language and state/action data from transform outputs
-                language = data[dataset.modality_keys["language"][0]][0]
-                missing_action_keys = [key for key in ["action"] if key not in data]
-                if missing_action_keys:
-                    raise KeyError(
-                        f"Missing required transformed keys {missing_action_keys} for dataset "
-                        f"{dataset.dataset_name}. Ensure action transforms and concat are configured."
-                    )
-                action = data["action"]
-
-                return dict(
-                    action=action,
-                    image=all_images,
-                    video=all_videos,
-                    primary_images=prim_images,
-                    wrist_images=wrist_images,
-                    primary_videos=prim_videos,
-                    lang=language,
-                    state=data["state"],
-                    embodiment_id=int(dataset.embodiment_id),
+                dataset, trajectory_id, step, selected_video_keys = self._sample_candidate(
+                    current_index,
+                    max_video_retries=max_retries,
                 )
+                raw_data = dataset.get_step_data(
+                    trajectory_id,
+                    step,
+                    modality_keys_override={"video": selected_video_keys},
+                )
+                data = dataset.transforms(raw_data)
+                return self._build_output_sample(dataset, data, selected_video_keys)
 
                 
             except Exception as e:
                 last_exception = e
                 if attempt < max_retries - 1:
                     # Log the error but continue trying
-                    print(f"Attempt {attempt + 1}/{max_retries} failed for index {index}: {e}")
+                    print(f"Attempt {attempt + 1}/{max_retries} failed for index {current_index}: {e}")
                     print(f"Retrying with new sample...")
-                    # For retry, we can use a slightly different index to get a new sample
-                    # This helps avoid getting stuck on the same problematic sample
-                    index = random.randint(0, len(self) - 1)
+                    current_index = self._get_retry_index(index, attempt, reason="exception")
                 else:
                     # All retries exhausted
-                    print(f"All {max_retries} attempts failed for index {index}")
+                    print(f"All {max_retries} attempts failed for index {current_index}")
                     print(f"Last error: {last_exception}")
-                    # Return a dummy sample or re-raise the exception
                     raise last_exception
 
     def __len__(self) -> int:

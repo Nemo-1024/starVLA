@@ -13,22 +13,31 @@ framework:
     # base_vlm: "/mnt/project_rlinf/jlchen/code/UniVLA/vla_scripts/vla_log/0205_180315+vla_emb_gt_lam_plus/checkpoints/checkpoint-170000"
     base_vlm: "/mnt/project_rlinf/jlchen/weights/Qwen3-VL-2B-Instruct"
   action_model:
-    future_action_window_size: 7
+    future_action_window_size: 31
     past_action_window_size: 0
-    action_horizon: 8
-    lam_ckpt_path: "/mnt/project_rlinf/jlchen/code/starVLA/latent_action_model/logs/dino_base_ae_bigwin/version_1/checkpoints/epoch=2.ckpt"
-    lam_yaml_path: "/mnt/project_rlinf/jlchen/code/starVLA/latent_action_model/logs/dino_base_ae_bigwin/version_1/dino_base_ae.yaml"
+    action_horizon: 32
+    lam_ckpt_path: "/mnt/project_rlinf/jlchen/code/starVLA/latent_action_model/logs/dino_large_vae/version_10/checkpoints/epoch=3.ckpt"
+    lam_yaml_path: "/mnt/project_rlinf/jlchen/code/starVLA/latent_action_model/logs/dino_large_vae/version_10/dino_large_vae.yaml"
     num_action_queries: 8
     perceptual_weight: 0.1
     latent_action_placeholder_token: "<ACT_PH>"
     flow_only_mode: false
+    # Flow future conditioning schedule:
+    # false: always use h_t1_pred
+    # true: early use h_t1_gt more, then ramp to h_t1_pred
+    enable_flow_h_t1_scheduled_sampling: true
+    flow_h_t1_pred_prob_start: 0.0
+    flow_h_t1_pred_prob_end: 1.0
+    flow_h_t1_pred_ramp_steps: 20000
+    # true: detach future feature from LAM decoder for flow branch regardless of schedule
+    detach_future_feature: true
     future_prediction: true
-    enable_wrist_view: false # 设为 true 时要求样本提供单腕 wrist_images（当前不处理 None/多腕）
+    enable_wrist_view: true # 设为 true 时要求样本提供单腕 wrist_images（当前不处理 None/多腕）
     enable_loss_distill: true
     lam_encoder_distill_weight: 0.1
     flow_cfg:
-      action_dim: 7
-      state_dim: 8
+      action_dim: 14
+      state_dim: 14
       vlm_dim: 2048
       # vision_dim: 768 # 基本无效：LatentWorldVLA 初始化会自动对齐为 LAM 输出维度
       # num_vision_tokens: 256 # 基本无效：LatentWorldVLA 初始化会自动对齐为 LAM token 数
@@ -42,6 +51,14 @@ framework:
       cfg_guidance_scale: 1.0
       num_inference_steps: 20
       num_timestep_buckets: 1000
+      horizon_sec: 0.8
+      noise_schedule: jit_lognormal
+      P_mean: -0.8
+      P_std: 0.8
+      t_eps: 5.0e-2
+      sample_eps: 1.0e-5
+      noise_scale: 1.0
+      # legacy beta schedule (only used when noise_schedule=beta)
       noise_beta_alpha: 1.5
       noise_beta_beta: 1.0
       noise_s: 0.999
@@ -53,11 +70,15 @@ datasets:
     # data_mix_fallback: libero # 无效：当前 dataloader/训练入口未读取该字段
     # action_type: delta_qpos # 无效：当前 lerobot_datasets / LatentWorldVLAIndependent 路径未读取该字段
     image_resolution: 256
-    per_device_batch_size: 64
+    per_device_batch_size: 32
     # load_all_data_for_training: true # 无效：当前数据管线未读取该字段
     # obs: ["image_0"] # 无效：当前视角来源由 robot_type 对应 data_config.video_keys 决定
     video_backend: pyav
     num_frames: 2
+    # Optional: override action horizon by seconds per chunk.
+    # Example: sec_chunk: 1.6  -> action_indices = range(int(1.6 * fps))
+    sec_chunk: 0.8
+    # Non-wrist view selection policy is internal: keep all wrist views and sample one non-wrist view per sample.
     # image_aug: true # 无效：当前 VLA dataloader/transform 路径未读取该字段
     # shuffle_buffer_size: 20000 # 无效：当前 dataloader 不做该字段控制的缓存打乱
     # use_history_frame: false # 无效：当前 VLA 训练路径未读取该字段
@@ -66,22 +87,27 @@ datasets:
 
 trainer:
   max_train_steps: 50000
-  num_warmup_steps: 5000
+  num_warmup_steps: 10000
   save_interval: 10000
-  eval_interval: 2000
-  eval_batches: 50
+  eval_interval: 1000
+  eval_batches: 100
   learning_rate:
     base: 1.0e-4
-  lr_scheduler_type: cosine_with_min_lr
-  scheduler_specific_kwargs:
-    min_lr: 1.0e-06
+    pretrained:
+      lr: 1.0e-5
+      modules:
+        - policy_backend.vlm
+        - policy_backend.lam.decoder
+  # Linear warmup to base LR, then keep LR constant.
+  lr_scheduler_type: constant_with_warmup
+  scheduler_specific_kwargs: {}
   freeze:
     freeze_vision_backbone: true
-    freeze_llm_backbone: true
+    freeze_llm_backbone: false
     freeze_last_llm_layer: true
     freeze_embedding: true
     unfreeze_vision_merger: true
-    unfreeze_llm_last_n_layers: 4
+    unfreeze_llm_last_n_layers: -1
     unfreeze_lam_decoder: true
   logging_frequency: 50
   gradient_clipping: 1.0
